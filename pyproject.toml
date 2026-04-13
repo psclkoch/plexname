@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "plexname"
+version = "1.0.0"
+description = "Plex-Ordner aus IMDb/TMDB erstellen"
+requires-python = ">=3.9"
+dependencies = ["requests"]
+
+[tool.setuptools]
+py-modules = ["movie_fix", "config"]
+
+[project.scripts]
+plexname = "movie_fix:main"
