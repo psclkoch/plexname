@@ -7,6 +7,9 @@ name = "plexname"
 version = "1.0.0"
 description = "Create Plex-compatible folders from IMDb/TMDB"
 requires-python = ">=3.9"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{name = "Pascal Koch"}]
 dependencies = ["requests"]
 
 [tool.setuptools]
