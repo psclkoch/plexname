@@ -826,6 +826,180 @@ class TestMovieFix(unittest.TestCase):
         self.assertIn("Season 12", seasons)
         shutil.rmtree(self.series_dir, ignore_errors=True)
 
+    # --- format_folder_name (pure function, all preset × id_type combinations) ---
+
+    def test_format_name_plex_movie(self):
+        self.assertEqual(
+            medianame.format_folder_name("Inception", "2010", "imdb", "tt1375666", "plex"),
+            "Inception (2010) {imdb-tt1375666}",
+        )
+
+    def test_format_name_plex_series(self):
+        self.assertEqual(
+            medianame.format_folder_name("Breaking Bad", "2008", "tmdb", "1396", "plex"),
+            "Breaking Bad (2008) {tmdb-1396}",
+        )
+
+    def test_format_name_jellyfin_movie_imdb(self):
+        self.assertEqual(
+            medianame.format_folder_name("Inception", "2010", "imdb", "tt1375666", "jellyfin"),
+            "Inception (2010) [imdbid-tt1375666]",
+        )
+
+    def test_format_name_jellyfin_movie_tmdb(self):
+        self.assertEqual(
+            medianame.format_folder_name("Inception", "2010", "tmdb", "27205", "jellyfin"),
+            "Inception (2010) [tmdbid-27205]",
+        )
+
+    def test_format_name_jellyfin_series_tmdb(self):
+        self.assertEqual(
+            medianame.format_folder_name("Breaking Bad", "2008", "tmdb", "1396", "jellyfin"),
+            "Breaking Bad (2008) [tmdbid-1396]",
+        )
+
+    def test_format_name_jellyfin_series_imdb(self):
+        self.assertEqual(
+            medianame.format_folder_name("Breaking Bad", "2008", "imdb", "tt0903747", "jellyfin"),
+            "Breaking Bad (2008) [imdbid-tt0903747]",
+        )
+
+    def test_format_name_unknown_preset_falls_back_to_plex(self):
+        """Unknown preset should behave like Plex (defensive default)."""
+        self.assertEqual(
+            medianame.format_folder_name("Foo", "2020", "imdb", "tt123", "emby"),
+            "Foo (2020) {imdb-tt123}",
+        )
+
+    # --- Jellyfin preset integration ---
+
+    def test_jellyfin_movie_from_imdb_url(self):
+        """Jellyfin + movie + imdb source → [imdbid-ttXXX] folder."""
+        medianame.NAMING_PRESET = "jellyfin"
+        medianame.MOVIE_ID_SOURCE = "imdb"
+        try:
+            medianame.INPUT_FILE = self._create_input_file(["tt0133093"])
+            mock_response = {"Response": "True", "Title": "The Matrix", "Year": "1999"}
+            with patch("medianame.get_movie_data", return_value=mock_response):
+                medianame.process_list()
+            folders = self._get_created_folders()
+            self.assertEqual(len(folders), 1)
+            self.assertIn("[imdbid-tt0133093]", folders[0])
+        finally:
+            medianame.NAMING_PRESET = "plex"
+
+    def test_jellyfin_movie_tmdb_source_triggers_find_lookup(self):
+        """Jellyfin + movie + tmdb source: IMDb input → /find → tmdb ID in folder."""
+        medianame.NAMING_PRESET = "jellyfin"
+        medianame.MOVIE_ID_SOURCE = "tmdb"
+        try:
+            medianame.INPUT_FILE = self._create_input_file(["tt0133093"])
+            mock_response = {"Response": "True", "Title": "The Matrix", "Year": "1999"}
+            find_response = {"movie_results": [{"id": 603, "title": "The Matrix"}]}
+            with patch("medianame.get_movie_data", return_value=mock_response):
+                with patch("medianame._tmdb_request", return_value=find_response):
+                    medianame.process_list()
+            folders = self._get_created_folders()
+            self.assertEqual(len(folders), 1)
+            self.assertIn("[tmdbid-603]", folders[0])
+        finally:
+            medianame.NAMING_PRESET = "plex"
+            medianame.MOVIE_ID_SOURCE = "imdb"
+
+    def test_jellyfin_series_imdb_source_uses_external_ids(self):
+        """Jellyfin + series + imdb source: TMDB details → imdb_id via external_ids."""
+        self.series_dir = tempfile.mkdtemp()
+        medianame.SERIES_PATH = self.series_dir
+        medianame.NAMING_PRESET = "jellyfin"
+        medianame.SERIES_ID_SOURCE = "imdb"
+        try:
+            # Details response now includes external_ids (the feature we added)
+            details_response = {
+                "id": 1396, "name": "Breaking Bad", "first_air_date": "2008-01-20",
+                "number_of_seasons": 5,
+                "credits": {"cast": [{"name": "Bryan Cranston"}]},
+                "external_ids": {"imdb_id": "tt0903747"},
+            }
+            with patch("medianame._tmdb_request", return_value=details_response):
+                with patch("builtins.input", side_effect=[
+                    "https://www.themoviedb.org/tv/1396-breaking-bad", "", ""
+                ]):
+                    medianame.process_list(prompt_mode=True)
+            folders = [f for f in os.listdir(self.series_dir)
+                       if os.path.isdir(os.path.join(self.series_dir, f))]
+            self.assertEqual(len(folders), 1)
+            self.assertIn("[imdbid-tt0903747]", folders[0])
+        finally:
+            medianame.NAMING_PRESET = "plex"
+            medianame.SERIES_ID_SOURCE = "tmdb"
+            shutil.rmtree(self.series_dir, ignore_errors=True)
+
+    def test_preset_override_wins_over_config(self):
+        """preset_override argument overrides the configured preset for one run."""
+        # Configured as Plex, but override as Jellyfin for this run
+        medianame.NAMING_PRESET = "plex"
+        medianame.INPUT_FILE = self._create_input_file(["tt0133093"])
+        mock_response = {"Response": "True", "Title": "The Matrix", "Year": "1999"}
+        with patch("medianame.get_movie_data", return_value=mock_response):
+            medianame.process_list(preset_override="jellyfin")
+        folders = self._get_created_folders()
+        self.assertEqual(len(folders), 1)
+        self.assertIn("[imdbid-tt0133093]", folders[0])
+        self.assertNotIn("{", folders[0])
+
+    def test_jellyfin_series_imdb_missing_skipped(self):
+        """Jellyfin + series + imdb source, but no imdb_id from TMDB → skip."""
+        self.series_dir = tempfile.mkdtemp()
+        medianame.SERIES_PATH = self.series_dir
+        medianame.NAMING_PRESET = "jellyfin"
+        medianame.SERIES_ID_SOURCE = "imdb"
+        try:
+            details_response = {
+                "id": 1396, "name": "Obscure Show", "first_air_date": "2020-01-01",
+                "number_of_seasons": 1,
+                "credits": {"cast": []},
+                "external_ids": {"imdb_id": None},
+            }
+            with patch("medianame._tmdb_request", return_value=details_response):
+                with patch("builtins.input", side_effect=[
+                    "https://www.themoviedb.org/tv/1396-obscure", "", ""
+                ]):
+                    medianame.process_list(prompt_mode=True)
+            folders = [f for f in os.listdir(self.series_dir)
+                       if os.path.isdir(os.path.join(self.series_dir, f))]
+            self.assertEqual(len(folders), 0)
+        finally:
+            medianame.NAMING_PRESET = "plex"
+            medianame.SERIES_ID_SOURCE = "tmdb"
+            shutil.rmtree(self.series_dir, ignore_errors=True)
+
+    # --- get_tmdb_id_from_imdb ---
+
+    def test_get_tmdb_id_from_imdb_movie(self):
+        """IMDb ID resolves to TMDB ID for a movie."""
+        response = {"movie_results": [{"id": 603, "title": "X"}], "tv_results": []}
+        with patch("medianame._tmdb_request", return_value=response):
+            result = medianame.get_tmdb_id_from_imdb("tt0133093", "movie")
+        self.assertEqual(result, "603")
+
+    def test_get_tmdb_id_from_imdb_tv(self):
+        """IMDb ID resolves to TMDB ID for a TV show."""
+        response = {"movie_results": [], "tv_results": [{"id": 1396, "name": "Y"}]}
+        with patch("medianame._tmdb_request", return_value=response):
+            result = medianame.get_tmdb_id_from_imdb("tt0903747", "tv")
+        self.assertEqual(result, "1396")
+
+    def test_get_tmdb_id_from_imdb_not_found(self):
+        """No results → returns None."""
+        with patch("medianame._tmdb_request",
+                   return_value={"movie_results": [], "tv_results": []}):
+            self.assertIsNone(medianame.get_tmdb_id_from_imdb("tt9999999", "movie"))
+
+    def test_get_tmdb_id_from_imdb_network_error(self):
+        """Network error → returns None."""
+        with patch("medianame._tmdb_request", side_effect=Exception("down")):
+            self.assertIsNone(medianame.get_tmdb_id_from_imdb("tt0133093", "movie"))
+
     def _create_input_file(self, lines):
         """Helper: create a temporary input file (not in the target directory)."""
         path = os.path.join(self.temp_input_dir, "test_movies.txt")
