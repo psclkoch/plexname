@@ -23,9 +23,17 @@ class TestMovieFix(unittest.TestCase):
         self.original_movie_path = movie_fix.MOVIE_PATH
         self.original_input_file = movie_fix.INPUT_FILE
         movie_fix.MOVIE_PATH = self.temp_dir
+        # Clear module caches so state doesn't leak between tests
+        movie_fix._movie_cache.clear()
+        movie_fix._tmdb_cache.clear()
+        # Safety net: prevent real network calls. Individual tests override
+        # this via `with patch("movie_fix._tmdb_request", ...)` as needed.
+        self._tmdb_patcher = patch("movie_fix._tmdb_request", return_value={"results": []})
+        self._tmdb_patcher.start()
 
     def tearDown(self):
         """Clean up."""
+        self._tmdb_patcher.stop()
         movie_fix.MOVIE_PATH = self.original_movie_path
         movie_fix.INPUT_FILE = self.original_input_file
         shutil.rmtree(self.temp_dir, ignore_errors=True)
@@ -505,6 +513,317 @@ class TestMovieFix(unittest.TestCase):
         series_folders = [f for f in os.listdir(self.series_dir)
                           if os.path.isdir(os.path.join(self.series_dir, f))]
         self.assertEqual(len(series_folders), 1)
+        shutil.rmtree(self.series_dir, ignore_errors=True)
+
+    # --- _prompt_seasons edge cases ---
+
+    def test_prompt_seasons_known_count_accepts_enter(self):
+        """Empty input with known season count → returns known count."""
+        with patch("builtins.input", return_value=""):
+            result = movie_fix._prompt_seasons(known_seasons=5)
+        self.assertEqual(result, 5)
+
+    def test_prompt_seasons_numeric_override(self):
+        """User enters a number → that number is used."""
+        with patch("builtins.input", return_value="3"):
+            result = movie_fix._prompt_seasons(known_seasons=5)
+        self.assertEqual(result, 3)
+
+    def test_prompt_seasons_zero_clamped_to_one(self):
+        """User enters 0 → clamped to 1."""
+        with patch("builtins.input", return_value="0"):
+            result = movie_fix._prompt_seasons(known_seasons=5)
+        self.assertEqual(result, 1)
+
+    def test_prompt_seasons_negative_clamped_to_one(self):
+        """User enters negative → clamped to 1."""
+        with patch("builtins.input", return_value="-3"):
+            result = movie_fix._prompt_seasons(known_seasons=5)
+        self.assertEqual(result, 1)
+
+    def test_prompt_seasons_non_numeric_with_known(self):
+        """Non-numeric input with known count → returns known count."""
+        with patch("builtins.input", return_value="five"):
+            result = movie_fix._prompt_seasons(known_seasons=5)
+        self.assertEqual(result, 5)
+
+    def test_prompt_seasons_non_numeric_without_known(self):
+        """Non-numeric input without known count → returns 1."""
+        with patch("builtins.input", return_value="abc"):
+            result = movie_fix._prompt_seasons(known_seasons=None)
+        self.assertEqual(result, 1)
+
+    def test_prompt_seasons_eof_returns_default(self):
+        """EOFError during input → returns known count."""
+        with patch("builtins.input", side_effect=EOFError()):
+            result = movie_fix._prompt_seasons(known_seasons=5)
+        self.assertEqual(result, 5)
+
+    def test_prompt_seasons_eof_no_known(self):
+        """EOFError with no known count → returns 1."""
+        with patch("builtins.input", side_effect=EOFError()):
+            result = movie_fix._prompt_seasons(known_seasons=None)
+        self.assertEqual(result, 1)
+
+    # --- get_movie_data retry and cache ---
+
+    def test_get_movie_data_uses_cache(self):
+        """Second call with same id returns cached result without HTTP."""
+        movie_fix._movie_cache["tt1234567"] = {"Response": "True", "Title": "Cached"}
+        with patch("movie_fix.requests.get") as mock_get:
+            result = movie_fix.get_movie_data("tt1234567")
+        mock_get.assert_not_called()
+        self.assertEqual(result["Title"], "Cached")
+
+    def test_get_movie_data_retries_on_network_error(self):
+        """Transient network errors trigger retries until success."""
+        call_count = {"n": 0}
+
+        class MockResponse:
+            def json(self):
+                return {"Response": "True", "Title": "OK", "Year": "2020"}
+
+        def flaky_get(*args, **kwargs):
+            call_count["n"] += 1
+            if call_count["n"] < 3:
+                raise Exception("transient")
+            return MockResponse()
+
+        with patch("movie_fix.requests.get", side_effect=flaky_get):
+            with patch("movie_fix.time.sleep"):
+                result = movie_fix.get_movie_data("tt9999001")
+        self.assertEqual(call_count["n"], 3)
+        self.assertIsNotNone(result)
+        self.assertEqual(result["Title"], "OK")
+
+    def test_get_movie_data_all_retries_fail(self):
+        """All retries fail → returns None."""
+        with patch("movie_fix.requests.get", side_effect=Exception("down")):
+            with patch("movie_fix.time.sleep"):
+                result = movie_fix.get_movie_data("tt9999002")
+        self.assertIsNone(result)
+
+    # --- search_by_title Stage 2 (numbered list) ---
+
+    def test_search_stage2_user_picks_number(self):
+        """User rejects best match, picks number 2 from the list."""
+        search_response = {"results": [
+            {"id": 1, "media_type": "movie", "title": "First", "release_date": "2000-01-01"},
+            {"id": 2, "media_type": "movie", "title": "Second", "release_date": "2001-01-01"},
+            {"id": 3, "media_type": "tv", "name": "Third", "first_air_date": "2002-01-01"},
+        ]}
+        details_first = {"Response": "True", "Title": "First", "Year": "2000",
+                         "Actors": "X", "imdbID": "tt0000001"}
+        details_second = {"Response": "True", "Title": "Second", "Year": "2001",
+                          "Actors": "Y", "imdbID": "tt0000002"}
+        with patch("movie_fix._tmdb_request", return_value=search_response):
+            with patch("movie_fix.get_tmdb_details",
+                       side_effect=[details_first, details_second]):
+                with patch("builtins.input", side_effect=["n", "2"]):
+                    result = movie_fix.search_by_title("foo")
+        self.assertEqual(result, ("tt0000002", "movie", None))
+
+    def test_search_stage2_picks_tv_show(self):
+        """Stage 2: user picks a TV show entry."""
+        search_response = {"results": [
+            {"id": 1, "media_type": "movie", "title": "First", "release_date": "2000-01-01"},
+            {"id": 1396, "media_type": "tv", "name": "Breaking Bad",
+             "first_air_date": "2008-01-01"},
+        ]}
+        details_first = {"Response": "True", "Title": "First", "Year": "2000",
+                         "Actors": "X", "imdbID": "tt0000001"}
+        details_tv = {"Response": "True", "Title": "Breaking Bad", "Year": "2008",
+                      "Actors": "Bryan", "Seasons": 5}
+        with patch("movie_fix._tmdb_request", return_value=search_response):
+            with patch("movie_fix.get_tmdb_details",
+                       side_effect=[details_first, details_tv]):
+                with patch("builtins.input", side_effect=["n", "2", ""]):
+                    result = movie_fix.search_by_title("foo")
+        self.assertEqual(result, ("1396", "tv", 5))
+
+    def test_search_stage2_invalid_number(self):
+        """User picks out-of-range number → returns None."""
+        search_response = {"results": [
+            {"id": 1, "media_type": "movie", "title": "Only", "release_date": "2000-01-01"},
+        ]}
+        details = {"Response": "True", "Title": "Only", "Year": "2000",
+                   "Actors": "X", "imdbID": "tt0000001"}
+        with patch("movie_fix._tmdb_request", return_value=search_response):
+            with patch("movie_fix.get_tmdb_details", return_value=details):
+                with patch("builtins.input", side_effect=["n", "99"]):
+                    result = movie_fix.search_by_title("foo")
+        self.assertIsNone(result)
+
+    def test_search_stage2_non_numeric_input(self):
+        """User enters non-numeric choice in Stage 2 → returns None."""
+        search_response = {"results": [
+            {"id": 1, "media_type": "movie", "title": "Only", "release_date": "2000-01-01"},
+        ]}
+        details = {"Response": "True", "Title": "Only", "Year": "2000",
+                   "Actors": "X", "imdbID": "tt0000001"}
+        with patch("movie_fix._tmdb_request", return_value=search_response):
+            with patch("movie_fix.get_tmdb_details", return_value=details):
+                with patch("builtins.input", side_effect=["n", "abc"]):
+                    result = movie_fix.search_by_title("foo")
+        self.assertIsNone(result)
+
+    def test_search_stage2_empty_skip(self):
+        """User enters empty choice in Stage 2 → returns None."""
+        search_response = {"results": [
+            {"id": 1, "media_type": "movie", "title": "Only", "release_date": "2000-01-01"},
+        ]}
+        details = {"Response": "True", "Title": "Only", "Year": "2000",
+                   "Actors": "X", "imdbID": "tt0000001"}
+        with patch("movie_fix._tmdb_request", return_value=search_response):
+            with patch("movie_fix.get_tmdb_details", return_value=details):
+                with patch("builtins.input", side_effect=["n", ""]):
+                    result = movie_fix.search_by_title("foo")
+        self.assertIsNone(result)
+
+    def test_search_no_results_returns_none(self):
+        """TMDB returns empty result list → search returns None."""
+        with patch("movie_fix._tmdb_request", return_value={"results": []}):
+            result = movie_fix.search_by_title("nonexistent-xyz")
+        self.assertIsNone(result)
+
+    def test_search_movie_without_imdb_id(self):
+        """Best-match movie without IMDb ID → returns None."""
+        search_response = {"results": [
+            {"id": 1, "media_type": "movie", "title": "Obscure", "release_date": "2000-01-01"},
+        ]}
+        details = {"Response": "True", "Title": "Obscure", "Year": "2000",
+                   "Actors": "X", "imdbID": ""}
+        with patch("movie_fix._tmdb_request", return_value=search_response):
+            with patch("movie_fix.get_tmdb_details", return_value=details):
+                with patch("builtins.input", return_value=""):
+                    result = movie_fix.search_by_title("obscure")
+        self.assertIsNone(result)
+
+    def test_search_network_error(self):
+        """Network error during search → returns None without crash."""
+        with patch("movie_fix._tmdb_request", side_effect=Exception("net down")):
+            result = movie_fix.search_by_title("anything")
+        self.assertIsNone(result)
+
+    # --- get_tmdb_details error paths ---
+
+    def test_get_tmdb_details_network_error(self):
+        """Network error during details fetch → returns None."""
+        with patch("movie_fix._tmdb_request", side_effect=Exception("timeout")):
+            result = movie_fix.get_tmdb_details("1396", "tv")
+        self.assertIsNone(result)
+
+    def test_get_tmdb_details_invalid_response(self):
+        """TMDB returns response without 'id' → returns None."""
+        with patch("movie_fix._tmdb_request",
+                   return_value={"status_code": 34, "status_message": "Not found"}):
+            result = movie_fix.get_tmdb_details("99999", "tv")
+        self.assertIsNone(result)
+
+    def test_tmdb_cache_avoids_duplicate_calls(self):
+        """Second fetch of the same TMDB id uses the cache."""
+        details_response = {
+            "id": 1396, "name": "BB", "first_air_date": "2008-01-01",
+            "number_of_seasons": 5, "credits": {"cast": []},
+        }
+        with patch("movie_fix._tmdb_request", return_value=details_response) as mock_req:
+            movie_fix.get_tmdb_details("1396", "tv")
+            movie_fix.get_tmdb_details("1396", "tv")
+        self.assertEqual(mock_req.call_count, 1)
+
+    # --- Interactive mode variants ---
+
+    def test_interactive_cancel_on_confirm(self):
+        """Interactive mode: user answers 'n' on final confirm → no folders."""
+        movie_fix.INPUT_FILE = self._create_input_file(["tt0133093"])
+        mock_response = {"Response": "True", "Title": "The Matrix", "Year": "1999"}
+        with patch("movie_fix.get_movie_data", return_value=mock_response):
+            with patch("builtins.input", return_value="n"):
+                movie_fix.process_list(interactive=True)
+        self.assertEqual(len(self._get_created_folders()), 0)
+
+    def test_dry_run_series_creates_nothing(self):
+        """Dry run for TV show: prints preview, creates no folders."""
+        self.series_dir = tempfile.mkdtemp()
+        movie_fix.SERIES_PATH = self.series_dir
+        search_response = {"results": [
+            {"id": 1396, "media_type": "tv", "name": "Breaking Bad",
+             "first_air_date": "2008-01-20"},
+        ]}
+        details_response = {
+            "id": 1396, "name": "Breaking Bad", "first_air_date": "2008-01-20",
+            "number_of_seasons": 5,
+            "credits": {"cast": [{"name": "Bryan Cranston"}]},
+        }
+        with patch("movie_fix._tmdb_request",
+                   side_effect=[search_response, details_response]):
+            with patch("builtins.input", side_effect=["breaking bad", "", ""]):
+                movie_fix.process_list(dry_run=True, prompt_mode=True)
+        folders = [f for f in os.listdir(self.series_dir)
+                   if os.path.isdir(os.path.join(self.series_dir, f))]
+        self.assertEqual(len(folders), 0)
+        shutil.rmtree(self.series_dir, ignore_errors=True)
+
+    # --- Input file edge cases ---
+
+    def test_comment_lines_preserved(self):
+        """# comment lines are preserved after processing."""
+        input_path = self._create_input_file([
+            "# My movies to process",
+            "tt0133093",
+            "",
+            "# Inception next",
+            "tt1375666",
+        ])
+        movie_fix.INPUT_FILE = input_path
+
+        def mock_api(imdb_id):
+            return {"Response": "True", "Title": f"Movie {imdb_id}", "Year": "2000"}
+
+        with patch("movie_fix.get_movie_data", side_effect=mock_api):
+            movie_fix.process_list()
+        with open(input_path, encoding="utf-8") as f:
+            content = f.read()
+        self.assertIn("# My movies to process", content)
+        self.assertIn("# Inception next", content)
+        self.assertNotIn("tt0133093", content)
+        self.assertNotIn("tt1375666", content)
+
+    def test_comment_only_file_falls_through_to_prompt(self):
+        """File with only comments → falls through to prompt mode."""
+        movie_fix.INPUT_FILE = self._create_input_file([
+            "# just comments",
+            "# no links here",
+        ])
+        with patch("builtins.input", return_value=""):
+            movie_fix.process_list()
+        self.assertEqual(len(self._get_created_folders()), 0)
+
+    # --- Seasons with double-digit formatting ---
+
+    def test_twelve_seasons_formatting(self):
+        """Shows with 10+ seasons get correctly formatted Season 10, 11, 12."""
+        self.series_dir = tempfile.mkdtemp()
+        movie_fix.SERIES_PATH = self.series_dir
+        details_response = {
+            "id": 999, "name": "Long Show", "first_air_date": "1990-01-01",
+            "number_of_seasons": 12,
+            "credits": {"cast": [{"name": "X"}]},
+        }
+        with patch("movie_fix._tmdb_request", return_value=details_response):
+            with patch("builtins.input", side_effect=[
+                "https://www.themoviedb.org/tv/999-long-show", "", ""
+            ]):
+                movie_fix.process_list(prompt_mode=True)
+        folders = [f for f in os.listdir(self.series_dir)
+                   if os.path.isdir(os.path.join(self.series_dir, f))]
+        self.assertEqual(len(folders), 1)
+        series_path = os.path.join(self.series_dir, folders[0])
+        seasons = sorted(os.listdir(series_path))
+        self.assertEqual(len(seasons), 12)
+        self.assertIn("Season 01", seasons)
+        self.assertIn("Season 10", seasons)
+        self.assertIn("Season 12", seasons)
         shutil.rmtree(self.series_dir, ignore_errors=True)
 
     def _create_input_file(self, lines):
