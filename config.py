@@ -83,6 +83,13 @@ def run_setup():
     print("=" * 50)
 
     existing = load_config() or {}
+    if existing:
+        print()
+        print("ℹ️ An existing configuration was found.")
+        print("   Press Enter at any prompt to keep the value shown in [brackets].")
+    else:
+        print()
+        print("ℹ️ Press Enter at any prompt with a default in [brackets] to accept it.")
 
     # 1. OMDb API Key
     print()
@@ -170,7 +177,8 @@ def run_setup():
     print("    Top-level entries matching these names are skipped entirely.")
     print("    Defaults already cover: #recycle, @eaDir, .Trash, lost+found,")
     print("    System Volume Information, $RECYCLE.BIN.")
-    print("    Add your own as comma-separated names (e.g. Hoerbuecher, ROMs, XXX).")
+    print("    Add your own as comma-separated names — typical extras are")
+    print("    top-level folders you don't want touched (e.g. Downloads, Music, Photos).")
     existing_extras = existing.get("scan_ignore", []) or []
     default_extras = ", ".join(existing_extras) if existing_extras else ""
     raw = input(f"    Extra ignores [{default_extras}]: ").strip()
@@ -178,6 +186,17 @@ def run_setup():
         scan_ignore = list(existing_extras)
     else:
         scan_ignore = [p.strip() for p in raw.split(",") if p.strip()]
+
+    # 11. Default max age (days) for `scan`
+    print()
+    print("11) Default maximum age for `scan` entries (in days)")
+    print("    0 = no limit (process every matching entry, regardless of mtime).")
+    print("    Any positive number restricts scans to entries modified within")
+    print("    the last N days — useful if you drop new downloads into an")
+    print("    already-populated library folder. Override per run: --max-age-days.")
+    default_max_age = int(existing.get("scan_max_age_days", 0))
+    scan_max_age_days = _prompt_int("    Max age (days, 0 = disabled)",
+                                     default_max_age, minimum=0)
 
     cfg = {
         "omdb_api_key": omdb_key,
@@ -190,6 +209,7 @@ def run_setup():
         "default_operation": default_operation,
         "min_video_size_mb": min_video_size_mb,
         "scan_ignore": scan_ignore,
+        "scan_max_age_days": scan_max_age_days,
     }
 
     save_config(cfg)

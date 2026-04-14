@@ -70,6 +70,8 @@ Not configured yet. Starting setup...
   🎬 medianame — First-time setup
 ==================================================
 
+ℹ️ Press Enter at any prompt with a default in [brackets] to accept it.
+
 1) OMDb API Key (for movie lookups via IMDb ID)
 2) TMDB Read Access Token (for title search, TV shows, cast)
 3) Movie folder (root of your movie library)
@@ -80,11 +82,12 @@ Not configured yet. Starting setup...
 8) Default operation for `scan` (move / copy)
 9) Minimum video size for `scan` (in MB, default 500)
 10) Extra scan ignores (comma-separated; defaults cover #recycle, @eaDir, …)
+11) Default max age (days) for `scan` (0 = no limit)
 
 ✅ Configuration saved: ~/.config/medianame/config.json
 ```
 
-Your configuration is stored in `~/.config/medianame/config.json`. Run `medianame setup` at any time to change it.
+Your configuration is stored in `~/.config/medianame/config.json`. Run `medianame setup` at any time to change it — existing values are shown in brackets and kept by pressing Enter (nothing needs to be re-typed).
 
 ## Usage
 
@@ -121,15 +124,17 @@ What gets picked up:
 - TV episodes land in `Season NN/` subfolders based on the parsed season number
 - If a destination file already exists, you're prompted per conflict: skip / overwrite / abort
 
+After a successful **move**, the original source folder is deleted along with any leftovers inside it (NFOs, screenshots, sample subfolders, …). The upfront confirmation prompt covers both the move and the cleanup in one step. When the operation is **copy**, the source is always preserved.
+
 What is **automatically skipped** so scans on large library volumes stay fast:
 
 - Folders that already carry a medianame ID tag (`{imdb-…}`, `{tmdb-…}`, `[imdbid-…]`, `[tmdbid-…]`) — they're assumed to be processed
 - OS / NAS metadata: `#recycle`, `@eaDir`, `.Trash`, `lost+found`, `System Volume Information`, `$RECYCLE.BIN`, `.DS_Store`, …
-- Anything you add as an extra ignore (setup step 10) — useful for folders like `Movies`, `Pictures`, `Music`
+- Anything you add as an extra ignore (setup step 10)
 - Subfolders deeper than 2 levels inside a scan item (scene releases never nest deeper)
-- Optional: entries older than `--max-age-days N`, if you routinely drop new downloads into an already-populated library folder
+- Entries older than the configured max age, when set (setup step 11 or `--max-age-days N`)
 
-The default operation (`move` or `copy`) is set during `medianame setup` (step 8) and can be overridden per run with `--copy` / `--move`.
+The default operation (`move` or `copy`) is set during `medianame setup` (step 8) and can be overridden per run with `--copy` / `--move`. The default max-age is step 11 and can be overridden with `--max-age-days`.
 
 > **Note on title matching.** TMDB search is driven only by the parsed title; the parsed year is used to re-rank results (preferring the matching year, then ±1). Appending the year to the query string would confuse TMDB's multi-search and return zero hits for otherwise obvious titles.
 

@@ -1199,6 +1199,7 @@ class TestScanFeature(unittest.TestCase):
         self._write_file(src, medianame.MIN_VIDEO_BYTES)
         target = os.path.join(self.movie_target, "Movie (2020) {imdb-tt1}")
         plan = [{
+            "source": src,
             "source_name": "Movie.2020.mkv",
             "target_path": target,
             "folder_name": "Movie (2020) {imdb-tt1}",
@@ -1213,6 +1214,92 @@ class TestScanFeature(unittest.TestCase):
             os.path.join(target, "Movie.2020.mkv")
         ))
         self.assertFalse(os.path.exists(src))
+
+    def test_execute_plan_removes_source_folder_on_move(self):
+        """After a successful move, the original source folder is deleted
+        (including leftover .nfo, samples, etc.)."""
+        folder = os.path.join(self.source_dir, "Movie.2020.BluRay-GROUP")
+        video = os.path.join(folder, "Movie.2020.mkv")
+        self._write_file(video, medianame.MIN_VIDEO_BYTES)
+        # Leftovers that won't be in media_files
+        self._write_file(os.path.join(folder, "Movie.2020.nfo"), 500)
+        self._write_file(os.path.join(folder, "screenshot.jpg"), 500)
+        target = os.path.join(self.movie_target, "Movie (2020) {imdb-tt1}")
+        plan = [{
+            "source": folder,
+            "source_name": "Movie.2020.BluRay-GROUP",
+            "target_path": target,
+            "folder_name": "Movie (2020) {imdb-tt1}",
+            "media_type": "movie",
+            "seasons": None,
+            "parsed_season": None,
+            "media_files": [(video, "video")],
+        }]
+        counts = medianame.execute_scan_plan(plan, operation="move")
+        self.assertEqual(counts["moved"], 1)
+        self.assertEqual(counts["cleaned"], 1)
+        # Source folder (and all leftovers inside) is gone
+        self.assertFalse(os.path.exists(folder))
+        # Video made it to the target
+        self.assertTrue(os.path.exists(
+            os.path.join(target, "Movie.2020.mkv")
+        ))
+
+    def test_execute_plan_does_not_delete_source_on_copy(self):
+        folder = os.path.join(self.source_dir, "Movie.2020")
+        video = os.path.join(folder, "Movie.2020.mkv")
+        self._write_file(video, 1024)
+        self._write_file(os.path.join(folder, "Movie.2020.nfo"), 50)
+        target = os.path.join(self.movie_target, "Movie (2020) {imdb-tt1}")
+        plan = [{
+            "source": folder,
+            "source_name": "Movie.2020",
+            "target_path": target,
+            "folder_name": "Movie (2020) {imdb-tt1}",
+            "media_type": "movie",
+            "seasons": None,
+            "parsed_season": None,
+            "media_files": [(video, "video")],
+        }]
+        counts = medianame.execute_scan_plan(plan, operation="copy")
+        self.assertEqual(counts["copied"], 1)
+        self.assertEqual(counts.get("cleaned", 0), 0)
+        # Source folder preserved in full
+        self.assertTrue(os.path.isdir(folder))
+        self.assertTrue(os.path.exists(
+            os.path.join(folder, "Movie.2020.nfo")
+        ))
+
+    def test_execute_plan_keeps_source_if_move_incomplete(self):
+        """If any media file is skipped due to conflict, keep the source."""
+        folder = os.path.join(self.source_dir, "Movie.2020")
+        video = os.path.join(folder, "Movie.2020.mkv")
+        with open(self._ensure_parent(video), "wb") as f:
+            f.write(b"new")
+        target = os.path.join(self.movie_target, "Movie (2020) {imdb-tt1}")
+        os.makedirs(target)
+        existing = os.path.join(target, "Movie.2020.mkv")
+        with open(existing, "wb") as f:
+            f.write(b"old")
+        plan = [{
+            "source": folder,
+            "source_name": "Movie.2020",
+            "target_path": target,
+            "folder_name": "Movie (2020) {imdb-tt1}",
+            "media_type": "movie",
+            "seasons": None,
+            "parsed_season": None,
+            "media_files": [(video, "video")],
+        }]
+        with patch("builtins.input", return_value="s"):  # skip conflict
+            counts = medianame.execute_scan_plan(plan, operation="move")
+        self.assertEqual(counts["skipped"], 1)
+        self.assertEqual(counts.get("cleaned", 0), 0)
+        self.assertTrue(os.path.isdir(folder))  # preserved
+
+    def _ensure_parent(self, path):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        return path
 
     def test_execute_plan_copies_files(self):
         src = os.path.join(self.source_dir, "Movie.2020.mkv")
@@ -1315,8 +1402,8 @@ class TestScanFeature(unittest.TestCase):
         self.assertTrue(medianame._is_library_folder("Show (2020) {tmdb-1}"))
         self.assertTrue(medianame._is_library_folder("Show (2020) [tmdbid-1]"))
         self.assertTrue(medianame._is_library_folder("A (2020) [imdbid-tt9]"))
-        self.assertFalse(medianame._is_library_folder("Goon.2011.BluRay"))
-        self.assertFalse(medianame._is_library_folder("Filme"))
+        self.assertFalse(medianame._is_library_folder("Movie.2011.BluRay"))
+        self.assertFalse(medianame._is_library_folder("Downloads"))
 
     def test_scan_applies_max_age_days(self):
         recent = os.path.join(self.source_dir, "Recent.2024")

@@ -21,6 +21,13 @@ Usage:
     medianame -f movies.txt          # Use a different input file
     medianame -p                     # Prompt for titles (skip input file)
     medianame --preset jellyfin ...  # Override naming preset for this run
+    medianame scan [<path>]          # Scan a folder and move/copy raw media
+                                     # into named library folders. After a
+                                     # successful move, the source folder is
+                                     # cleaned up automatically.
+    medianame scan --copy <path>     # Scan and copy instead of move
+    medianame scan --max-age-days N  # Restrict scan to entries from the last N days
+    medianame setup                  # (Re)configure API keys, paths, preset
     # When the input file is empty, prompt mode starts automatically.
 """
 
@@ -44,6 +51,9 @@ MIN_VIDEO_BYTES = MIN_VIDEO_SIZE_MB * 1024 * 1024
 # Max folder recursion depth when collecting media files under a scan item.
 # Scene releases keep videos at depth 0-1; TV packs at depth 0-2 at most.
 SCAN_MAX_DEPTH = 2
+
+# Default --max-age-days for `scan` (0 = no limit). Loaded from config.
+SCAN_MAX_AGE_DAYS = 0
 
 # Folders whose name matches one of these (case-insensitive, exact match)
 # are skipped entirely during scan. Users can extend this list via the
@@ -1019,6 +1029,7 @@ def build_scan_plan(items, preset):
             print("  ⏭️  Skipped.")
             continue
         plan.append({
+            "source": item["source"],
             "source_name": item["name"],
             "target_path": resolved["target_path"],
             "folder_name": resolved["folder_name"],
@@ -1080,7 +1091,8 @@ def execute_scan_plan(plan, operation="move"):
     Returns:
         dict with counts: moved, copied, skipped, failed.
     """
-    counts = {"moved": 0, "copied": 0, "skipped": 0, "failed": 0}
+    counts = {"moved": 0, "copied": 0, "skipped": 0, "failed": 0,
+              "cleaned": 0}
     op_fn = shutil.move if operation == "move" else shutil.copy2
     verb_past = "Moved" if operation == "move" else "Copied"
     counter_key = "moved" if operation == "move" else "copied"
@@ -1095,6 +1107,7 @@ def execute_scan_plan(plan, operation="move"):
             counts["failed"] += len(entry["media_files"])
             continue
 
+        entry_ok = True   # True only if every media file moved without error/skip
         for src, kind in entry["media_files"]:
             dest = _destination_for(entry, src)
             os.makedirs(os.path.dirname(dest), exist_ok=True)
@@ -1105,6 +1118,7 @@ def execute_scan_plan(plan, operation="move"):
                     return counts
                 if decision == "skip":
                     counts["skipped"] += 1
+                    entry_ok = False
                     continue
                 # overwrite
                 try:
@@ -1112,6 +1126,7 @@ def execute_scan_plan(plan, operation="move"):
                 except OSError as e:
                     print(f"  ❌ Could not remove existing {dest}: {e}")
                     counts["failed"] += 1
+                    entry_ok = False
                     continue
             try:
                 op_fn(src, dest)
@@ -1120,6 +1135,22 @@ def execute_scan_plan(plan, operation="move"):
             except OSError as e:
                 print(f"  ❌ Failed {os.path.basename(src)}: {e}")
                 counts["failed"] += 1
+                entry_ok = False
+
+        # After a successful MOVE of all qualifying files, delete the now-
+        # residual source folder (samples, NFOs, screenshots, …). Never
+        # touch the source for copy. Only applies when source is a folder
+        # (single-file sources are fully moved by the loop above).
+        source = entry.get("source")
+        if (operation == "move" and entry_ok
+                and source and os.path.isdir(source)):
+            try:
+                shutil.rmtree(source)
+                print(f"  🧹 Removed source folder: {entry['source_name']}")
+                counts["cleaned"] += 1
+            except OSError as e:
+                print(f"  ⚠️ Could not remove source folder {source}: {e}")
+
     return counts
 
 
@@ -1171,8 +1202,13 @@ def process_scan(source_path=None, operation=None, preset_override=None,
         for src, _ in entry["media_files"]:
             dest = _destination_for(entry, src)
             print(f"       {os.path.basename(src)} → {os.path.relpath(dest, entry['target_path'])}")
+    if op == "move":
+        prompt = (f"\nMove {len(plan)} item(s) and delete the original source "
+                  f"folder(s) afterwards? (y/n): ")
+    else:
+        prompt = f"\nCopy {len(plan)} item(s)? (y/n): "
     try:
-        answer = input(f"\n{op.capitalize()} {len(plan)} item(s)? (y/n): ").strip().lower()
+        answer = input(prompt).strip().lower()
     except (EOFError, KeyboardInterrupt):
         print()
         answer = "n"
@@ -1188,6 +1224,8 @@ def process_scan(source_path=None, operation=None, preset_override=None,
         parts.append(f"{counts['moved']} moved")
     if counts["copied"]:
         parts.append(f"{counts['copied']} copied")
+    if counts.get("cleaned"):
+        parts.append(f"{counts['cleaned']} source folder(s) removed")
     if counts["skipped"]:
         parts.append(f"{counts['skipped']} skipped")
     if counts["failed"]:
@@ -1220,8 +1258,13 @@ def _show_help():
         "  medianame -o /path <title>     Override target path (movies + series)",
         "  medianame --preset jellyfin .. Override naming preset for this run",
         "  medianame scan [<path>]        Scan a folder for raw media and",
-        "                                 move/copy into named library folders",
-        "  medianame scan --copy <path>   Scan and copy (instead of move)",
+        "                                 move/copy into named library folders.",
+        "                                 After a successful move, the original",
+        "                                 source folder (incl. samples, NFOs,",
+        "                                 screenshots) is removed automatically.",
+        "  medianame scan --copy <path>   Scan and copy (preserve source)",
+        "  medianame scan --max-age-days N",
+        "                                 Scan: only entries modified in the last N days",
         "  medianame setup                (Re)configure API keys, paths, preset",
         "  medianame help                 Show this help",
         "",
@@ -1263,6 +1306,8 @@ def _load_config():
     extras = cfg.get("scan_ignore", []) or []
     SCAN_IGNORE = set(DEFAULT_SCAN_IGNORE) | {str(e).strip().lower()
                                                for e in extras if str(e).strip()}
+    global SCAN_MAX_AGE_DAYS
+    SCAN_MAX_AGE_DAYS = int(cfg.get("scan_max_age_days", 0) or 0)
 
 
 def main():
@@ -1279,8 +1324,9 @@ def main():
     parser.add_argument("--preset", choices=["plex", "jellyfin"], help="Override naming preset for this run")
     parser.add_argument("--copy", action="store_true", help="Scan only: copy instead of move")
     parser.add_argument("--move", action="store_true", help="Scan only: move instead of copy")
-    parser.add_argument("--max-age-days", type=int, default=0, metavar="N",
-                        help="Scan only: skip entries older than N days (default: no limit)")
+    parser.add_argument("--max-age-days", type=int, default=None, metavar="N",
+                        help="Scan only: skip entries older than N days "
+                             "(default: value from config, 0 = no limit)")
     args = parser.parse_args()
 
     # Handle setup and help before loading config
@@ -1297,9 +1343,12 @@ def main():
             print("❌ --copy and --move are mutually exclusive.")
             return
         operation = "copy" if args.copy else ("move" if args.move else None)
+        # CLI flag overrides config; if absent, fall back to configured default.
+        max_age = args.max_age_days if args.max_age_days is not None \
+            else SCAN_MAX_AGE_DAYS
         process_scan(source_path=scan_path, operation=operation,
                      preset_override=args.preset,
-                     max_age_days=args.max_age_days)
+                     max_age_days=max_age)
         return
 
     if args.title and args.title[0].lower() == "help":

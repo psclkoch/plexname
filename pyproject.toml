@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "medianame"
-version = "1.2.1"
+version = "1.2.2"
 description = "Create Plex- or Jellyfin-compatible folders from IMDb/TMDB, and scan source folders to move/copy media into them"
 readme = "README.md"
 requires-python = ">=3.9"
