@@ -104,7 +104,7 @@ medianame help                   # Show detailed help
 
 ### Scan mode (v1.2.0+)
 
-If you already have raw downloads like `Goon.2011.2160p.BluRay.x265-RANSOM.mkv` or folders like `The.Knick.S01.1080p.REMUX-FraMeSToR/`, scan mode parses the release names, looks each title up on TMDB with confirmation, creates the correctly-named library folder, and moves (or copies) the relevant media files into it.
+If you already have raw downloads like `Movie.2011.2160p.BluRay.x265-SceneGROUP.mkv` or folders like `TV.Show.S01.1080p.REMUX-SceneGROUP/`, scan mode parses the release names, looks each title up on TMDB with confirmation, creates the correctly-named library folder, and moves (or copies) the relevant media files into it.
 
 ```bash
 medianame scan                         # Interactive: pick movie or series folder
@@ -125,7 +125,7 @@ What is **automatically skipped** so scans on large library volumes stay fast:
 
 - Folders that already carry a medianame ID tag (`{imdb-…}`, `{tmdb-…}`, `[imdbid-…]`, `[tmdbid-…]`) — they're assumed to be processed
 - OS / NAS metadata: `#recycle`, `@eaDir`, `.Trash`, `lost+found`, `System Volume Information`, `$RECYCLE.BIN`, `.DS_Store`, …
-- Anything you add as an extra ignore (setup step 10) — useful for folders like `Hoerbuecher`, `ROMs`, `XXX`
+- Anything you add as an extra ignore (setup step 10) — useful for folders like `Movies`, `Pictures`, `Music`
 - Subfolders deeper than 2 levels inside a scan item (scene releases never nest deeper)
 - Optional: entries older than `--max-age-days N`, if you routinely drop new downloads into an already-populated library folder
 
