@@ -120,6 +120,12 @@ medianame scan --copy <path>           # Keep the source (default is move)
 medianame scan --max-age-days 7 <path> # Only look at entries modified in the last 7 days
 ```
 
+**When scan can't resolve an entry** (e.g. a `Download Station` folder or a one-off mystery filename), you get a three-way prompt before it's skipped:
+
+- `[i]` Add to ignore list — the name is persisted to your config's `scan_ignore` and skipped on every future scan, no extra setup required.
+- `[m]` Enter title manually — useful when the parsed release name is wrong and you want to tell medianame the real title.
+- `[s]` Skip (this run only) — default when you just press Enter.
+
 What gets picked up:
 
 - **Videos** (`.mkv .mp4 .avi .m4v .mov`) — only files above the configured minimum size are kept, so samples, trailers, and extras are filtered out. The threshold defaults to 500 MB and can be changed in `medianame setup` (step 9).

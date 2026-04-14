@@ -973,27 +973,102 @@ def _choose_scan_source():
     return None
 
 
+def _prompt_unmatched_scan_item(entry_name):
+    """
+    When a scan item could not be resolved via TMDB, ask the user what
+    to do. Returns one of:
+        ("ignore", None)     — add entry_name to scan_ignore (persisted)
+        ("retry", new_title) — re-run the title search with a manual title
+        ("skip", None)       — skip this entry for this run only
+    """
+    print()
+    print(f"     🤔 Couldn't resolve: {entry_name}")
+    print(f"        [i] Add to ignore list (never scan again)")
+    print(f"        [m] Enter title manually")
+    print(f"        [s] Skip (this run only)")
+    while True:
+        try:
+            choice = input("        Choice [Enter = skip]: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return ("skip", None)
+        if choice in ("", "s", "skip"):
+            return ("skip", None)
+        if choice in ("i", "ignore"):
+            return ("ignore", None)
+        if choice in ("m", "manual", "t", "title"):
+            try:
+                title = input("        Title: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                return ("skip", None)
+            if not title:
+                return ("skip", None)
+            return ("retry", title)
+
+
+def _add_to_scan_ignore(name):
+    """
+    Persist `name` to the config's scan_ignore list and update the
+    in-memory SCAN_IGNORE set so subsequent items in the same run are
+    also filtered.
+    """
+    global SCAN_IGNORE
+    import config as _config
+    cfg = _config.load_config() or {}
+    extras = list(cfg.get("scan_ignore") or [])
+    # Deduplicate case-insensitively
+    if not any(e.strip().lower() == name.strip().lower() for e in extras):
+        extras.append(name)
+        cfg["scan_ignore"] = extras
+        _config.save_config(cfg)
+    SCAN_IGNORE = SCAN_IGNORE | {name.strip().lower()}
+    print(f"        ✅ Added to ignore list: {name}")
+
+
 def _resolve_scan_item(item, preset):
     """
     Resolve one scan item to a folder name + target library path by
     asking TMDB (using the title/year guessit extracted, with interactive
     confirmation via search_by_title).
 
+    If the TMDB lookup fails or the user rejects all suggestions, offer
+    three follow-up options: add the entry name to the ignore list,
+    try again with a manually entered title, or skip this run only.
+
     Returns:
         dict with folder_name, target_path, seasons (int|None), or None on skip.
     """
     parsed = item["parsed"]
     title = parsed.get("title")
+
     if not title:
         print(f"  ⚠️ Could not parse title from: {item['name']}")
-        return None
+        # Still offer the fallback menu — the user might know better.
+        action, payload = _prompt_unmatched_scan_item(item["name"])
+        if action == "ignore":
+            _add_to_scan_ignore(item["name"])
+            return None
+        if action != "retry":
+            return None
+        title = payload
+        # Drop the (missing) year hint on manual retry
+        parsed = dict(parsed, year=None)
 
     # Pass year as a *hint* for re-ranking, not as part of the query string.
     # TMDB's /search/multi treats extra words as title keywords, so
     # "Boyz n the Hood 1991" returns zero results.
     result = search_by_title(title, year_hint=parsed.get("year"))
-    if not result:
-        return None
+    while not result:
+        action, payload = _prompt_unmatched_scan_item(item["name"])
+        if action == "ignore":
+            _add_to_scan_ignore(item["name"])
+            return None
+        if action == "skip":
+            return None
+        # retry with manual title
+        title = payload
+        result = search_by_title(title, year_hint=None)
     entry_id, media_type, seasons = result
 
     # Fetch details for folder naming

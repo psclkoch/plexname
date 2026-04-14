@@ -1948,6 +1948,70 @@ class TestPublishFeature(unittest.TestCase):
         # Should print an error and return without raising
         medianame.process_publish()
 
+    def test_unmatched_prompt_retry(self):
+        """[m] + manual title → second search succeeds."""
+        item = {"name": "Download Station", "source": "/tmp/x",
+                "parsed": {"title": "Download Station", "year": None,
+                           "type": None, "season": None},
+                "media_files": []}
+        # First search: no hits. Second search (after manual title): a movie.
+        search_results = [
+            None,
+            ("tt1", "movie", None),
+        ]
+        with patch("medianame.search_by_title",
+                   side_effect=search_results), \
+             patch("medianame._prompt_unmatched_scan_item",
+                   return_value=("retry", "Inception")), \
+             patch("medianame.get_movie_data",
+                   return_value={"Response": "True", "Title": "Inception",
+                                 "Year": "2010", "Actors": "X",
+                                 "imdbID": "tt1"}):
+            medianame.MOVIE_PATH = "/tmp"
+            resolved = medianame._resolve_scan_item(item, "plex")
+        self.assertIsNotNone(resolved)
+        self.assertEqual(resolved["folder_name"],
+                         "Inception (2010) {imdb-tt1}")
+
+    def test_unmatched_prompt_ignore_persists(self):
+        """[i] → entry added to scan_ignore + config saved."""
+        item = {"name": "Download Station", "source": "/tmp/x",
+                "parsed": {"title": "Download Station", "year": None,
+                           "type": None, "season": None},
+                "media_files": []}
+        saved_configs = []
+
+        class _FakeConfig:
+            @staticmethod
+            def load_config():
+                return {"scan_ignore": []}
+
+            @staticmethod
+            def save_config(cfg):
+                saved_configs.append(cfg)
+
+        with patch("medianame.search_by_title", return_value=None), \
+             patch("medianame._prompt_unmatched_scan_item",
+                   return_value=("ignore", None)), \
+             patch.dict("sys.modules", {"config": _FakeConfig}):
+            resolved = medianame._resolve_scan_item(item, "plex")
+        self.assertIsNone(resolved)
+        self.assertEqual(len(saved_configs), 1)
+        self.assertIn("Download Station", saved_configs[0]["scan_ignore"])
+        self.assertIn("download station", medianame.SCAN_IGNORE)
+
+    def test_unmatched_prompt_skip(self):
+        """[s] → returns None without touching config."""
+        item = {"name": "Download Station", "source": "/tmp/x",
+                "parsed": {"title": "Download Station", "year": None,
+                           "type": None, "season": None},
+                "media_files": []}
+        with patch("medianame.search_by_title", return_value=None), \
+             patch("medianame._prompt_unmatched_scan_item",
+                   return_value=("skip", None)):
+            resolved = medianame._resolve_scan_item(item, "plex")
+        self.assertIsNone(resolved)
+
     def test_predict_publish_plan_title_only_match(self):
         """Verify the predicted plan catches 'Send Help' → 'Send Help (2026)…'.
         This is the regression case from the user report."""
