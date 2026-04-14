@@ -145,6 +145,15 @@ def run_setup():
         movie_id_source = "imdb"
         series_id_source = "tmdb"
 
+    # 8. Default operation for `medianame scan`
+    print()
+    print("8) Default operation for `medianame scan`")
+    print("   move → move files into the library folders (source is emptied)")
+    print("   copy → copy files (source is preserved)")
+    default_operation = existing.get("default_operation", "move")
+    default_operation = _prompt_choice("   Operation (move/copy)",
+                                        ["move", "copy"], default_operation)
+
     cfg = {
         "omdb_api_key": omdb_key,
         "tmdb_token": tmdb_token,
@@ -153,6 +162,7 @@ def run_setup():
         "naming_preset": preset,
         "movie_id_source": movie_id_source,
         "series_id_source": series_id_source,
+        "default_operation": default_operation,
     }
 
     save_config(cfg)

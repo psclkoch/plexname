@@ -92,9 +92,31 @@ medianame -n <title>             # Dry run — show what would be created
 medianame -o /path <title>       # Override target path for this run
 medianame -f movies.txt          # Batch mode — process IMDb URLs from a file
 medianame --preset jellyfin ...  # Override naming preset for this run
+medianame scan [<path>]          # Scan a folder and move raw media into named folders
+medianame scan --copy <path>     # Same, but copy instead of move
 medianame setup                  # (Re)configure API keys, paths, preset
 medianame help                   # Show detailed help
 ```
+
+### Scan mode (v1.2.0+)
+
+If you already have raw downloads like `Goon.2011.2160p.BluRay.x265-RANSOM.mkv` or folders like `The.Knick.S01.1080p.REMUX-FraMeSToR/`, scan mode parses the release names, looks each title up on TMDB with confirmation, creates the correctly-named library folder, and moves (or copies) the relevant media files into it.
+
+```bash
+medianame scan                   # Interactive: pick movie or series folder
+medianame scan ~/Downloads       # Scan a specific folder
+medianame scan --copy <path>     # Keep the source (default is move)
+```
+
+What gets picked up:
+
+- **Videos** (`.mkv .mp4 .avi .m4v .mov`) of at least 500 MB — samples, trailers, extras are filtered out
+- **All subtitle files** (`.srt .ass .sub .idx .vtt`) — every language is preserved
+- Filenames are kept as-is; only the enclosing folder gets renamed
+- TV episodes land in `Season NN/` subfolders based on the parsed season number
+- If a destination file already exists, you're prompted per conflict: skip / overwrite / abort
+
+The default operation (`move` or `copy`) is set during `medianame setup` and can be overridden per run with `--copy` / `--move`.
 
 ### Input formats
 
@@ -153,6 +175,13 @@ medianame uses two free APIs:
 
 - **[OMDb API](https://www.omdbapi.com/)** — for movie lookups by IMDb ID. Free tier: 1,000 requests/day.
 - **[TMDB API](https://www.themoviedb.org/documentation/api)** — for title search, TV show data, and cast info. Free for non-commercial use.
+
+## Dependencies
+
+Runtime dependencies (installed automatically by `pip` / `pipx`):
+
+- **[requests](https://pypi.org/project/requests/)** — HTTP client for the OMDb and TMDB APIs (Apache 2.0)
+- **[guessit](https://pypi.org/project/guessit/)** — parser for scene-style release filenames, used by `medianame scan` (LGPL-3.0; pure Python)
 
 ## License
 

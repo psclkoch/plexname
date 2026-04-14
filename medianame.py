@@ -33,6 +33,13 @@ import time
 import requests
 
 
+# --- Scan feature constants ---
+
+VIDEO_EXTENSIONS = {".mkv", ".mp4", ".avi", ".m4v", ".mov"}
+SUBTITLE_EXTENSIONS = {".srt", ".ass", ".sub", ".idx", ".vtt"}
+MIN_VIDEO_BYTES = 500 * 1024 * 1024  # 500 MB — filters out samples, extras, trailers
+
+
 # --- Configuration (loaded at startup from ~/.config/plexname/config.json) ---
 
 API_KEY = None
@@ -45,6 +52,7 @@ INPUT_FILE = "movies.txt"
 NAMING_PRESET = "plex"        # "plex" | "jellyfin"
 MOVIE_ID_SOURCE = "imdb"      # "imdb" | "tmdb"  (only used when preset=jellyfin)
 SERIES_ID_SOURCE = "tmdb"     # "imdb" | "tmdb"  (only used when preset=jellyfin)
+DEFAULT_OPERATION = "move"    # "move" | "copy"  (for `medianame scan`)
 
 
 MAX_RETRIES = 3
@@ -685,6 +693,402 @@ def process_list(dry_run=False, interactive=False, output_path=None, input_file=
             print("Cancelled.")
 
 
+# ===========================================================================
+# Scan feature — detect raw media in a source folder and move/copy into the
+# properly-named library folders.
+# ===========================================================================
+
+
+def parse_release_name(name):
+    """
+    Parse a scene-release filename or folder name with guessit.
+
+    Args:
+        name: Filename (with or without extension) or folder name.
+
+    Returns:
+        dict with keys: title (str|None), year (int|None),
+        type ("movie" | "tv" | None), season (int|None).
+    """
+    from guessit import guessit  # lazy import: only needed for `scan`
+    info = guessit(name)
+    raw_type = info.get("type")
+    if raw_type == "episode":
+        media_type = "tv"
+    elif raw_type == "movie":
+        media_type = "movie"
+    else:
+        media_type = None
+    return {
+        "title": info.get("title"),
+        "year": info.get("year"),
+        "type": media_type,
+        "season": info.get("season"),
+    }
+
+
+def _classify_media_file(path):
+    """
+    Return "video", "subtitle", or None for the given file path.
+
+    Videos must be >= MIN_VIDEO_BYTES. Files containing "sample" in their
+    name are always ignored.
+    """
+    name = os.path.basename(path).lower()
+    if "sample" in name:
+        return None
+    ext = os.path.splitext(name)[1].lower()
+    if ext in VIDEO_EXTENSIONS:
+        try:
+            if os.path.getsize(path) >= MIN_VIDEO_BYTES:
+                return "video"
+        except OSError:
+            return None
+        return None
+    if ext in SUBTITLE_EXTENSIONS:
+        return "subtitle"
+    return None
+
+
+def _collect_media_files(path):
+    """
+    Collect relevant media files from a path.
+
+    If `path` is a single file, classify it. If it's a directory, walk
+    recursively, skipping hidden and "sample" subdirectories.
+
+    Returns:
+        list of (absolute_path, kind) tuples, where kind is "video" or "subtitle".
+    """
+    results = []
+    if os.path.isfile(path):
+        kind = _classify_media_file(path)
+        if kind:
+            results.append((path, kind))
+        return results
+    if not os.path.isdir(path):
+        return results
+    for root, dirs, files in os.walk(path):
+        dirs[:] = sorted(
+            d for d in dirs
+            if not d.startswith(".") and "sample" not in d.lower()
+        )
+        for fname in sorted(files):
+            if fname.startswith("."):
+                continue
+            full = os.path.join(root, fname)
+            kind = _classify_media_file(full)
+            if kind:
+                results.append((full, kind))
+    return results
+
+
+def scan_source(source_path):
+    """
+    Scan `source_path` for media items.
+
+    Each top-level entry (file or folder) is treated as one item. Items
+    without any qualifying media files are skipped.
+
+    Returns:
+        list of dicts with keys: source (path), name (basename),
+        parsed (dict from parse_release_name), media_files (list of (path, kind)).
+    """
+    if not os.path.isdir(source_path):
+        print(f"❌ Scan source not found: {source_path}")
+        return []
+    items = []
+    for entry in sorted(os.listdir(source_path)):
+        if entry.startswith("."):
+            continue
+        full = os.path.join(source_path, entry)
+        media_files = _collect_media_files(full)
+        if not media_files:
+            continue
+        parsed = parse_release_name(entry)
+        items.append({
+            "source": full,
+            "name": entry,
+            "parsed": parsed,
+            "media_files": media_files,
+        })
+    return items
+
+
+def _choose_scan_source():
+    """
+    Ask the user which configured library path to scan.
+
+    Returns:
+        Path string, or None if the user cancelled.
+    """
+    print("Which folder should I scan?")
+    print(f"  [1] Movie folder:  {MOVIE_PATH}")
+    print(f"  [2] TV show folder: {SERIES_PATH}")
+    try:
+        choice = input("Pick 1 or 2 (empty = cancel): ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return None
+    if choice == "1":
+        return MOVIE_PATH
+    if choice == "2":
+        return SERIES_PATH
+    return None
+
+
+def _resolve_scan_item(item, preset):
+    """
+    Resolve one scan item to a folder name + target library path by
+    asking TMDB (using the title/year guessit extracted, with interactive
+    confirmation via search_by_title).
+
+    Returns:
+        dict with folder_name, target_path, seasons (int|None), or None on skip.
+    """
+    parsed = item["parsed"]
+    title = parsed.get("title")
+    if not title:
+        print(f"  ⚠️ Could not parse title from: {item['name']}")
+        return None
+    query = title
+    if parsed.get("year"):
+        query = f"{title} {parsed['year']}"
+
+    result = search_by_title(query)
+    if not result:
+        return None
+    entry_id, media_type, seasons = result
+
+    # Fetch details for folder naming
+    if media_type == "tv":
+        data = get_tmdb_details(entry_id, "tv")
+        target_root = SERIES_PATH
+    else:
+        data = get_movie_data(entry_id)
+        target_root = MOVIE_PATH
+    if not data or data.get("Response") != "True":
+        print(f"  ❌ Could not fetch details for {entry_id}")
+        return None
+
+    clean_title = re.sub(r'[<>:"/\\|?*]', '', data["Title"])
+    year = str(data.get("Year", "")).split("–")[0].split("-")[0].strip()
+    clean_year = re.sub(r'[<>:"/\\|?*]', '', year) or "0000"
+
+    want_id_type = _resolve_naming(media_type, preset)
+    id_value = _resolve_id_value(entry_id, media_type, want_id_type, data)
+    if not id_value:
+        print(f"  ❌ Could not resolve {want_id_type} ID")
+        return None
+
+    folder_name = format_folder_name(clean_title, clean_year,
+                                     want_id_type, id_value, preset)
+    full_path = os.path.join(target_root, folder_name)
+    # For TV: honour parsed season if present; else _prompt_seasons already ran
+    return {
+        "folder_name": folder_name,
+        "target_path": full_path,
+        "media_type": media_type,
+        "seasons": seasons,
+        "parsed_season": parsed.get("season"),
+    }
+
+
+def build_scan_plan(items, preset):
+    """
+    For each scanned item, ask TMDB + user to resolve the correct target
+    folder. Returns a list of plan entries:
+
+        {
+          "source_name": str,
+          "target_path": str,   # full path of the folder to create
+          "folder_name": str,
+          "media_type": "movie" | "tv",
+          "seasons": int | None,
+          "parsed_season": int | None,
+          "media_files": [(src, kind), ...],
+        }
+    """
+    plan = []
+    for idx, item in enumerate(items, 1):
+        print(f"\n[{idx}/{len(items)}] {item['name']}")
+        resolved = _resolve_scan_item(item, preset)
+        if not resolved:
+            print("  ⏭️  Skipped.")
+            continue
+        plan.append({
+            "source_name": item["name"],
+            "target_path": resolved["target_path"],
+            "folder_name": resolved["folder_name"],
+            "media_type": resolved["media_type"],
+            "seasons": resolved["seasons"],
+            "parsed_season": resolved["parsed_season"],
+            "media_files": item["media_files"],
+        })
+    return plan
+
+
+def _destination_for(plan_entry, src_file):
+    """
+    Decide the destination path for a single source file based on its
+    plan entry. Keeps the original filename.
+
+    Movies → directly in the movie folder.
+    TV     → inside Season NN subfolder. The season number comes from
+             the parsed release name; fallback = 1.
+    """
+    filename = os.path.basename(src_file)
+    if plan_entry["media_type"] == "tv":
+        season = plan_entry["parsed_season"] or 1
+        season_dir = os.path.join(plan_entry["target_path"],
+                                   f"Season {int(season):02d}")
+        return os.path.join(season_dir, filename)
+    return os.path.join(plan_entry["target_path"], filename)
+
+
+def _resolve_conflict(dest_path):
+    """
+    Ask the user what to do when a destination file already exists.
+
+    Returns: "skip", "overwrite", or "abort".
+    """
+    print(f"  ⚠️  Already exists: {dest_path}")
+    while True:
+        try:
+            answer = input("     [s]kip / [o]verwrite / [a]bort: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return "abort"
+        if answer in ("s", "skip"):
+            return "skip"
+        if answer in ("o", "overwrite"):
+            return "overwrite"
+        if answer in ("a", "abort"):
+            return "abort"
+
+
+def execute_scan_plan(plan, operation="move"):
+    """
+    Carry out the plan: create folders, move/copy media files.
+
+    Args:
+        plan: output of build_scan_plan().
+        operation: "move" or "copy".
+
+    Returns:
+        dict with counts: moved, copied, skipped, failed.
+    """
+    counts = {"moved": 0, "copied": 0, "skipped": 0, "failed": 0}
+    op_fn = shutil.move if operation == "move" else shutil.copy2
+    verb_past = "Moved" if operation == "move" else "Copied"
+    counter_key = "moved" if operation == "move" else "copied"
+
+    for entry in plan:
+        print(f"\n→ {entry['folder_name']}")
+        # Create target folder (and Season NN for TV)
+        try:
+            os.makedirs(entry["target_path"], exist_ok=True)
+        except OSError as e:
+            print(f"  ❌ Could not create {entry['target_path']}: {e}")
+            counts["failed"] += len(entry["media_files"])
+            continue
+
+        for src, kind in entry["media_files"]:
+            dest = _destination_for(entry, src)
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            if os.path.exists(dest):
+                decision = _resolve_conflict(dest)
+                if decision == "abort":
+                    print("  ⛔ Aborted by user.")
+                    return counts
+                if decision == "skip":
+                    counts["skipped"] += 1
+                    continue
+                # overwrite
+                try:
+                    os.remove(dest)
+                except OSError as e:
+                    print(f"  ❌ Could not remove existing {dest}: {e}")
+                    counts["failed"] += 1
+                    continue
+            try:
+                op_fn(src, dest)
+                print(f"  ✅ {verb_past}: {os.path.basename(src)}")
+                counts[counter_key] += 1
+            except OSError as e:
+                print(f"  ❌ Failed {os.path.basename(src)}: {e}")
+                counts["failed"] += 1
+    return counts
+
+
+def process_scan(source_path=None, operation=None, preset_override=None):
+    """
+    High-level entry point for `medianame scan`.
+
+    Args:
+        source_path: Folder to scan. If None, prompt the user.
+        operation: "move" or "copy". If None, use configured default.
+        preset_override: Naming preset override for this run.
+    """
+    if source_path is None:
+        source_path = _choose_scan_source()
+        if not source_path:
+            print("Cancelled.")
+            return
+    if not os.path.isdir(source_path):
+        print(f"❌ Not a directory: {source_path}")
+        return
+
+    op = operation or DEFAULT_OPERATION
+    preset = preset_override or NAMING_PRESET
+
+    print(f"🔍 Scanning: {source_path}")
+    items = scan_source(source_path)
+    if not items:
+        print("Nothing to process (no qualifying media files found).")
+        return
+    print(f"Found {len(items)} item(s) with media files.")
+
+    plan = build_scan_plan(items, preset)
+    if not plan:
+        print("\nNothing to do.")
+        return
+
+    # Show final plan and confirm
+    print(f"\n{'=' * 50}")
+    print(f"Plan ({op}):")
+    print("=" * 50)
+    for entry in plan:
+        print(f"  {entry['source_name']}")
+        print(f"    → {entry['target_path']}")
+        for src, _ in entry["media_files"]:
+            dest = _destination_for(entry, src)
+            print(f"       {os.path.basename(src)} → {os.path.relpath(dest, entry['target_path'])}")
+    try:
+        answer = input(f"\n{op.capitalize()} {len(plan)} item(s)? (y/n): ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        answer = "n"
+    if answer not in ("y", "yes", "j", "ja"):
+        print("Cancelled.")
+        return
+
+    counts = execute_scan_plan(plan, operation=op)
+
+    # Summary
+    parts = []
+    if counts["moved"]:
+        parts.append(f"{counts['moved']} moved")
+    if counts["copied"]:
+        parts.append(f"{counts['copied']} copied")
+    if counts["skipped"]:
+        parts.append(f"{counts['skipped']} skipped")
+    if counts["failed"]:
+        parts.append(f"{counts['failed']} failed")
+    if parts:
+        print(f"\n📊 Summary: {', '.join(parts)}")
+
+
 def _show_help():
     """Display detailed help text."""
     movie_path = MOVIE_PATH or "<not configured>"
@@ -708,6 +1112,9 @@ def _show_help():
         "  medianame -f movies.txt        Process IMDb URLs from file",
         "  medianame -o /path <title>     Override target path (movies + series)",
         "  medianame --preset jellyfin .. Override naming preset for this run",
+        "  medianame scan [<path>]        Scan a folder for raw media and",
+        "                                 move/copy into named library folders",
+        "  medianame scan --copy <path>   Scan and copy (instead of move)",
         "  medianame setup                (Re)configure API keys, paths, preset",
         "  medianame help                 Show this help",
         "",
@@ -730,7 +1137,7 @@ def _show_help():
 def _load_config():
     """Load configuration and set module globals."""
     global API_KEY, TMDB_TOKEN, MOVIE_PATH, SERIES_PATH
-    global NAMING_PRESET, MOVIE_ID_SOURCE, SERIES_ID_SOURCE
+    global NAMING_PRESET, MOVIE_ID_SOURCE, SERIES_ID_SOURCE, DEFAULT_OPERATION
     import config
     cfg = config.get_config()
     API_KEY = cfg["omdb_api_key"]
@@ -741,6 +1148,7 @@ def _load_config():
     NAMING_PRESET = cfg.get("naming_preset", "plex")
     MOVIE_ID_SOURCE = cfg.get("movie_id_source", "imdb")
     SERIES_ID_SOURCE = cfg.get("series_id_source", "tmdb")
+    DEFAULT_OPERATION = cfg.get("default_operation", "move")
 
 
 def main():
@@ -755,12 +1163,26 @@ def main():
     parser.add_argument("-f", "--file", metavar="FILE", dest="input_file", help="Alternative input file (default: movies.txt)")
     parser.add_argument("-p", "--prompt", action="store_true", help="Prompt for movies/series (skip input file)")
     parser.add_argument("--preset", choices=["plex", "jellyfin"], help="Override naming preset for this run")
+    parser.add_argument("--copy", action="store_true", help="Scan only: copy instead of move")
+    parser.add_argument("--move", action="store_true", help="Scan only: move instead of copy")
     args = parser.parse_args()
 
     # Handle setup and help before loading config
     if args.title and args.title[0].lower() == "setup":
         import config
         config.run_setup()
+        return
+
+    # `medianame scan [<path>]`
+    if args.title and args.title[0].lower() == "scan":
+        _load_config()
+        scan_path = " ".join(args.title[1:]) if len(args.title) > 1 else None
+        if args.copy and args.move:
+            print("❌ --copy and --move are mutually exclusive.")
+            return
+        operation = "copy" if args.copy else ("move" if args.move else None)
+        process_scan(source_path=scan_path, operation=operation,
+                     preset_override=args.preset)
         return
 
     if args.title and args.title[0].lower() == "help":

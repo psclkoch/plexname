@@ -1013,5 +1013,284 @@ class TestMovieFix(unittest.TestCase):
                 if os.path.isdir(os.path.join(self.temp_dir, f))]
 
 
+class TestScanFeature(unittest.TestCase):
+    """Tests for the v1.2.0 scan feature."""
+
+    def setUp(self):
+        self.source_dir = tempfile.mkdtemp()
+        self.movie_target = tempfile.mkdtemp()
+        self.series_target = tempfile.mkdtemp()
+        self._orig_movie = medianame.MOVIE_PATH
+        self._orig_series = medianame.SERIES_PATH
+        medianame.MOVIE_PATH = self.movie_target
+        medianame.SERIES_PATH = self.series_target
+        medianame._movie_cache.clear()
+        medianame._tmdb_cache.clear()
+
+    def tearDown(self):
+        medianame.MOVIE_PATH = self._orig_movie
+        medianame.SERIES_PATH = self._orig_series
+        shutil.rmtree(self.source_dir, ignore_errors=True)
+        shutil.rmtree(self.movie_target, ignore_errors=True)
+        shutil.rmtree(self.series_target, ignore_errors=True)
+
+    def _write_file(self, path, size_bytes=0):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as f:
+            if size_bytes:
+                f.seek(size_bytes - 1)
+                f.write(b"\0")
+
+    # --- parse_release_name -------------------------------------------------
+
+    def test_parse_movie_with_year(self):
+        info = medianame.parse_release_name(
+            "Goon.2011.2160p.UPSCALED.BluRay.DoVi.HDR10.x265.DTS-HD.MA.5.1-RANSOM.mkv"
+        )
+        self.assertEqual(info["title"], "Goon")
+        self.assertEqual(info["year"], 2011)
+        self.assertEqual(info["type"], "movie")
+
+    def test_parse_movie_multi_word_title(self):
+        info = medianame.parse_release_name(
+            "Beverly.Hills.Cop.1984.Hybrid.2160p.UHD.Blu-ray.Remux.DV.HDR10P.HEVC.FLAC.2.0-CiNEPHiLES.mkv"
+        )
+        self.assertEqual(info["title"], "Beverly Hills Cop")
+        self.assertEqual(info["year"], 1984)
+        self.assertEqual(info["type"], "movie")
+
+    def test_parse_tv_season_folder(self):
+        info = medianame.parse_release_name(
+            "The.Knick.S01.1080p.DTS-HD.MA.5.1.AVC.REMUX-FraMeSToR"
+        )
+        self.assertEqual(info["title"], "The Knick")
+        self.assertEqual(info["season"], 1)
+        self.assertEqual(info["type"], "tv")
+
+    def test_parse_tv_webdl(self):
+        info = medianame.parse_release_name(
+            "Strange.Angel.S01.1080p.AMZN.WEB-DL.DD+5.1.H.264-AJP69"
+        )
+        self.assertEqual(info["title"], "Strange Angel")
+        self.assertEqual(info["season"], 1)
+        self.assertEqual(info["type"], "tv")
+
+    # --- _classify_media_file ----------------------------------------------
+
+    def test_classify_video_above_threshold(self):
+        f = os.path.join(self.source_dir, "movie.mkv")
+        self._write_file(f, medianame.MIN_VIDEO_BYTES)
+        self.assertEqual(medianame._classify_media_file(f), "video")
+
+    def test_classify_video_below_threshold(self):
+        f = os.path.join(self.source_dir, "small.mkv")
+        self._write_file(f, 1024)
+        self.assertIsNone(medianame._classify_media_file(f))
+
+    def test_classify_subtitle_any_size(self):
+        f = os.path.join(self.source_dir, "movie.en.srt")
+        self._write_file(f, 100)
+        self.assertEqual(medianame._classify_media_file(f), "subtitle")
+
+    def test_classify_sample_ignored(self):
+        f = os.path.join(self.source_dir, "sample.mkv")
+        self._write_file(f, medianame.MIN_VIDEO_BYTES)
+        self.assertIsNone(medianame._classify_media_file(f))
+
+    def test_classify_unknown_extension(self):
+        f = os.path.join(self.source_dir, "readme.nfo")
+        self._write_file(f, 500)
+        self.assertIsNone(medianame._classify_media_file(f))
+
+    # --- _collect_media_files ----------------------------------------------
+
+    def test_collect_from_folder_skips_samples(self):
+        folder = os.path.join(self.source_dir, "Movie.2020")
+        self._write_file(os.path.join(folder, "Movie.2020.mkv"),
+                         medianame.MIN_VIDEO_BYTES)
+        self._write_file(os.path.join(folder, "Movie.2020.en.srt"), 50)
+        self._write_file(os.path.join(folder, "Sample", "sample.mkv"),
+                         medianame.MIN_VIDEO_BYTES)
+        self._write_file(os.path.join(folder, "readme.nfo"), 10)
+        results = medianame._collect_media_files(folder)
+        kinds = sorted(kind for _, kind in results)
+        self.assertEqual(kinds, ["subtitle", "video"])
+
+    def test_collect_single_file(self):
+        f = os.path.join(self.source_dir, "Movie.2020.mkv")
+        self._write_file(f, medianame.MIN_VIDEO_BYTES)
+        results = medianame._collect_media_files(f)
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0][1], "video")
+
+    # --- scan_source --------------------------------------------------------
+
+    def test_scan_source_skips_empty_items(self):
+        # Folder with no qualifying media → skipped
+        empty = os.path.join(self.source_dir, "Empty.2020")
+        os.makedirs(empty)
+        self._write_file(os.path.join(empty, "readme.nfo"), 10)
+        # Folder with a valid video → kept
+        keep = os.path.join(self.source_dir, "Movie.2020")
+        self._write_file(os.path.join(keep, "Movie.2020.mkv"),
+                         medianame.MIN_VIDEO_BYTES)
+        items = medianame.scan_source(self.source_dir)
+        names = [i["name"] for i in items]
+        self.assertEqual(names, ["Movie.2020"])
+
+    def test_scan_source_nonexistent(self):
+        items = medianame.scan_source(os.path.join(self.source_dir, "nope"))
+        self.assertEqual(items, [])
+
+    # --- _destination_for ---------------------------------------------------
+
+    def test_destination_for_movie(self):
+        entry = {
+            "target_path": "/lib/Movies/Goon (2011) {imdb-tt1499666}",
+            "media_type": "movie",
+            "parsed_season": None,
+        }
+        dest = medianame._destination_for(entry, "/src/Goon.2011.mkv")
+        self.assertEqual(
+            dest, "/lib/Movies/Goon (2011) {imdb-tt1499666}/Goon.2011.mkv"
+        )
+
+    def test_destination_for_tv_uses_parsed_season(self):
+        entry = {
+            "target_path": "/lib/TV/The Knick (2014) {tmdb-1259}",
+            "media_type": "tv",
+            "parsed_season": 1,
+        }
+        dest = medianame._destination_for(
+            entry, "/src/The.Knick.S01E01.mkv"
+        )
+        self.assertEqual(
+            dest,
+            "/lib/TV/The Knick (2014) {tmdb-1259}/Season 01/The.Knick.S01E01.mkv",
+        )
+
+    def test_destination_for_tv_defaults_to_season_1(self):
+        entry = {
+            "target_path": "/lib/TV/Show (2020) {tmdb-1}",
+            "media_type": "tv",
+            "parsed_season": None,
+        }
+        dest = medianame._destination_for(entry, "/src/Show.mkv")
+        self.assertIn("Season 01", dest)
+
+    # --- execute_scan_plan end-to-end --------------------------------------
+
+    def test_execute_plan_moves_files(self):
+        src = os.path.join(self.source_dir, "Movie.2020.mkv")
+        self._write_file(src, medianame.MIN_VIDEO_BYTES)
+        target = os.path.join(self.movie_target, "Movie (2020) {imdb-tt1}")
+        plan = [{
+            "source_name": "Movie.2020.mkv",
+            "target_path": target,
+            "folder_name": "Movie (2020) {imdb-tt1}",
+            "media_type": "movie",
+            "seasons": None,
+            "parsed_season": None,
+            "media_files": [(src, "video")],
+        }]
+        counts = medianame.execute_scan_plan(plan, operation="move")
+        self.assertEqual(counts["moved"], 1)
+        self.assertTrue(os.path.exists(
+            os.path.join(target, "Movie.2020.mkv")
+        ))
+        self.assertFalse(os.path.exists(src))
+
+    def test_execute_plan_copies_files(self):
+        src = os.path.join(self.source_dir, "Movie.2020.mkv")
+        self._write_file(src, 1024)  # small; we're bypassing classification
+        target = os.path.join(self.movie_target, "Movie (2020) {imdb-tt1}")
+        plan = [{
+            "source_name": "Movie.2020.mkv",
+            "target_path": target,
+            "folder_name": "Movie (2020) {imdb-tt1}",
+            "media_type": "movie",
+            "seasons": None,
+            "parsed_season": None,
+            "media_files": [(src, "video")],
+        }]
+        counts = medianame.execute_scan_plan(plan, operation="copy")
+        self.assertEqual(counts["copied"], 1)
+        self.assertTrue(os.path.exists(src))
+        self.assertTrue(os.path.exists(
+            os.path.join(target, "Movie.2020.mkv")
+        ))
+
+    def test_execute_plan_creates_season_folder_for_tv(self):
+        src = os.path.join(self.source_dir, "Show.S01E01.mkv")
+        self._write_file(src, 1024)
+        target = os.path.join(self.series_target, "Show (2020) {tmdb-1}")
+        plan = [{
+            "source_name": "Show.S01",
+            "target_path": target,
+            "folder_name": "Show (2020) {tmdb-1}",
+            "media_type": "tv",
+            "seasons": 1,
+            "parsed_season": 1,
+            "media_files": [(src, "video")],
+        }]
+        medianame.execute_scan_plan(plan, operation="move")
+        self.assertTrue(os.path.isdir(os.path.join(target, "Season 01")))
+        self.assertTrue(os.path.exists(
+            os.path.join(target, "Season 01", "Show.S01E01.mkv")
+        ))
+
+    def test_execute_plan_conflict_skip(self):
+        src = os.path.join(self.source_dir, "Movie.mkv")
+        self._write_file(src, 1024)
+        target = os.path.join(self.movie_target, "Movie (2020) {imdb-tt1}")
+        os.makedirs(target)
+        # Pre-create destination so it conflicts
+        existing = os.path.join(target, "Movie.mkv")
+        with open(existing, "wb") as f:
+            f.write(b"existing")
+        plan = [{
+            "source_name": "Movie.mkv",
+            "target_path": target,
+            "folder_name": "Movie (2020) {imdb-tt1}",
+            "media_type": "movie",
+            "seasons": None,
+            "parsed_season": None,
+            "media_files": [(src, "video")],
+        }]
+        with patch("builtins.input", return_value="s"):
+            counts = medianame.execute_scan_plan(plan, operation="move")
+        self.assertEqual(counts["skipped"], 1)
+        self.assertEqual(counts["moved"], 0)
+        # Source is still there (skipped)
+        self.assertTrue(os.path.exists(src))
+        # Existing untouched
+        with open(existing, "rb") as f:
+            self.assertEqual(f.read(), b"existing")
+
+    def test_execute_plan_conflict_overwrite(self):
+        src = os.path.join(self.source_dir, "Movie.mkv")
+        with open(src, "wb") as f:
+            f.write(b"new-content")
+        target = os.path.join(self.movie_target, "Movie (2020) {imdb-tt1}")
+        os.makedirs(target)
+        existing = os.path.join(target, "Movie.mkv")
+        with open(existing, "wb") as f:
+            f.write(b"old")
+        plan = [{
+            "source_name": "Movie.mkv",
+            "target_path": target,
+            "folder_name": "Movie (2020) {imdb-tt1}",
+            "media_type": "movie",
+            "seasons": None,
+            "parsed_season": None,
+            "media_files": [(src, "video")],
+        }]
+        with patch("builtins.input", return_value="o"):
+            counts = medianame.execute_scan_plan(plan, operation="move")
+        self.assertEqual(counts["moved"], 1)
+        with open(existing, "rb") as f:
+            self.assertEqual(f.read(), b"new-content")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

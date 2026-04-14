@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "medianame"
-version = "1.1.0"
-description = "Create Plex- or Jellyfin-compatible folders from IMDb/TMDB"
+version = "1.2.0"
+description = "Create Plex- or Jellyfin-compatible folders from IMDb/TMDB, and scan source folders to move/copy media into them"
 readme = "README.md"
 requires-python = ">=3.9"
 license = "MIT"
@@ -24,7 +24,7 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
     "Topic :: Multimedia :: Video",
 ]
-dependencies = ["requests"]
+dependencies = ["requests", "guessit"]
 
 [project.urls]
 Homepage = "https://github.com/psclkoch/medianame"
