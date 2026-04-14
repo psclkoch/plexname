@@ -1269,10 +1269,27 @@ def process_scan(source_path=None, operation=None, preset_override=None,
         print("\nNothing to do.")
         return
 
-    # Show final plan and confirm
-    _print_scan_plan(plan, op)
+    # Determine whether the optional publish step will run, and — if so —
+    # build its plan up front so we can show everything in one preview
+    # and ask for a single confirmation.
+    will_publish = (
+        publish_mode != "off"
+        and (MOVIE_LIBRARY_PATH or SERIES_LIBRARY_PATH)
+    )
+    publish_preview = []
+    if will_publish:
+        publish_preview = _predict_publish_plan(plan)
 
-    if op == "move":
+    # Show final plan(s) and confirm once
+    _print_scan_plan(plan, op)
+    if publish_preview:
+        _print_publish_plan(publish_preview)
+
+    if publish_preview:
+        prompt = (f"\nProceed: {op} {len(plan)} item(s) + publish "
+                  f"{len(publish_preview)} to library? "
+                  f"[Enter = yes, n = cancel]: ")
+    elif op == "move":
         prompt = (f"\nProceed: move {len(plan)} item(s) and delete the "
                   f"source folder(s)? [Enter = yes, n = cancel]: ")
     else:
@@ -1307,19 +1324,23 @@ def process_scan(source_path=None, operation=None, preset_override=None,
         print(f"\n📊 Summary: {', '.join(parts)}")
 
     # Optional publish step: move the freshly created library folders into
-    # the configured Plex/Jellyfin library paths.
+    # the configured Plex/Jellyfin library paths. If we already showed the
+    # publish preview in the combined confirmation above, skip the second
+    # confirmation here.
     if publish_mode == "off":
         return
     created = counts.get("created_folders") or set()
     if publish_mode == "auto":
         if not (MOVIE_LIBRARY_PATH or SERIES_LIBRARY_PATH):
             return
-        _publish_after_scan(created, operation="move")
+        _publish_after_scan(created, operation="move",
+                            skip_confirm=bool(publish_preview))
     elif publish_mode == "force":
         if not (MOVIE_LIBRARY_PATH or SERIES_LIBRARY_PATH):
             print("ℹ️ --publish requested but no library paths configured.")
             return
-        _publish_after_scan(created, operation="move")
+        _publish_after_scan(created, operation="move",
+                            skip_confirm=bool(publish_preview))
 
 
 # ===========================================================================
@@ -1340,6 +1361,8 @@ _COPY_BLOCK_BYTES = 4 * 1024 * 1024  # 4 MB
 _SEASON_DIR_RE = re.compile(r"^Season\s+(\d{1,3})$", re.IGNORECASE)
 # Matches folder names with our title/year prefix (with or without tag)
 _TITLE_YEAR_RE = re.compile(r"^(?P<base>.+?\(\d{4}\))(?:\s+[\{\[].+[\}\]])?\s*$")
+# Matches a trailing year in parentheses: "Inception (2010)" → year 2010
+_TRAILING_YEAR_RE = re.compile(r"\s*\((?P<year>\d{4})\)\s*$")
 
 
 def _fmt_size(num_bytes):
@@ -1473,15 +1496,43 @@ def _move_folder(src, dst):
     shutil.rmtree(src)
 
 
+def _split_title_year(folder_name):
+    """
+    Split a folder name into (bare_title, year_or_None), stripping any
+    trailing ID tag ({...} / [...]) and parenthesised year.
+
+    Examples:
+        "Inception (2010) {imdb-tt1375666}" → ("Inception", 2010)
+        "Inception (2010)"                   → ("Inception", 2010)
+        "Send Help"                          → ("Send Help", None)
+    """
+    # Strip trailing tag (possibly with leading whitespace)
+    name = re.sub(r"\s+[\{\[][^\}\]]+[\}\]]\s*$", "", folder_name).strip()
+    m = _TRAILING_YEAR_RE.search(name)
+    if m:
+        year = int(m.group("year"))
+        bare = name[:m.start()].strip()
+    else:
+        year = None
+        bare = name.strip()
+    return (bare, year)
+
+
 def _find_library_match(library_root, folder_name):
     """
-    Look for a folder in `library_root` that matches `folder_name` either
-    exactly or by title+year prefix (ignoring the ID tag).
+    Look for a folder in `library_root` that matches `folder_name`.
 
-    Returns:
-        ("exact", existing_name) — exact-name match, merge path
-        ("rename", existing_name) — same title+year, different tag/no tag
-        (None, None) — nothing matching
+    Match order:
+      1. Exact name → ("exact", existing_name)
+      2. Same bare title, matching year (or one side missing year)
+         → ("rename", existing_name)
+      3. Otherwise → (None, None)
+
+    Rule (2) handles the real-world cases:
+      - "Send Help"                     ↔  "Send Help (2026) {imdb-tt…}"
+      - "Inception (2010)"              ↔  "Inception (2010) {imdb-tt…}"
+      - "Inception (2010) {imdb-ttX}"   ↔  "Inception (2010) {imdb-ttY}"
+    A mismatch in year (different movies sharing a title) is NOT matched.
     """
     if not library_root or not os.path.isdir(library_root):
         return (None, None)
@@ -1491,13 +1542,17 @@ def _find_library_match(library_root, folder_name):
         return (None, None)
     if folder_name in entries:
         return ("exact", folder_name)
-    m = _TITLE_YEAR_RE.match(folder_name)
-    base = m.group("base") if m else None
-    if not base:
+    new_title, new_year = _split_title_year(folder_name)
+    if not new_title:
         return (None, None)
+    # Case-insensitive title match; year must agree (or one side empty)
     for existing in entries:
-        em = _TITLE_YEAR_RE.match(existing)
-        if em and em.group("base") == base and existing != folder_name:
+        if existing == folder_name:
+            continue
+        ex_title, ex_year = _split_title_year(existing)
+        if ex_title.lower() != new_title.lower():
+            continue
+        if new_year is None or ex_year is None or new_year == ex_year:
             return ("rename", existing)
     return (None, None)
 
@@ -2132,10 +2187,45 @@ def _dedupe_publish_plan(plan):
     return list(by_source.values())
 
 
-def _publish_after_scan(created_folders, operation="move"):
+def _predict_publish_plan(scan_plan):
+    """
+    Given a scan plan (list of entries with `target_path` + `media_type`),
+    predict the publish plan that would run after the scan — by looking
+    up each would-be staging folder's name against the configured library.
+
+    Used to show scan + publish in one combined preview.
+    """
+    items = []
+    for entry in scan_plan:
+        target = entry["target_path"]
+        name = os.path.basename(target)
+        parent = os.path.dirname(target)
+        media_type = entry.get("media_type", "movie")
+        if parent == MOVIE_PATH and MOVIE_LIBRARY_PATH:
+            lib = MOVIE_LIBRARY_PATH
+        elif parent == SERIES_PATH and SERIES_LIBRARY_PATH:
+            lib = SERIES_LIBRARY_PATH
+        else:
+            continue
+        if not _is_library_folder(name):
+            continue
+        kind, existing = _find_library_match(lib, name)
+        items.append({
+            "source": target,
+            "folder_name": name,
+            "media_type": media_type,
+            "library_root": lib,
+            "match": kind or "new",
+            "existing_name": existing,
+        })
+    return items
+
+
+def _publish_after_scan(created_folders, operation="move", skip_confirm=False):
     """
     After a successful scan, publish any tag-named folders we just created.
-    `created_folders` is a set of absolute paths.
+    `created_folders` is a set of absolute paths. When `skip_confirm` is
+    true, the scan+publish combined preview has already been confirmed.
     """
     if not created_folders:
         return
@@ -2180,16 +2270,18 @@ def _publish_after_scan(created_folders, operation="move"):
 
     print()
     print("📤 Publishing to library...")
-    _print_publish_plan(plan_items)
-    try:
-        answer = input(f"\nProceed: publish {len(plan_items)} item(s) to library? "
-                       f"[Enter = yes, n = skip publish]: ").strip().lower()
-    except (EOFError, KeyboardInterrupt):
-        print()
-        answer = "n"
-    if answer not in ("", "y", "yes", "j", "ja"):
-        print("Publish skipped.")
-        return
+    if not skip_confirm:
+        _print_publish_plan(plan_items)
+        try:
+            answer = input(f"\nProceed: publish {len(plan_items)} item(s) "
+                           f"to library? "
+                           f"[Enter = yes, n = skip publish]: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            answer = "n"
+        if answer not in ("", "y", "yes", "j", "ja"):
+            print("Publish skipped.")
+            return
     counts = execute_publish_plan(plan_items, operation=operation)
     parts = []
     if counts["moved"]:

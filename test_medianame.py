@@ -1619,12 +1619,50 @@ class TestPublishFeature(unittest.TestCase):
         self.assertEqual(kind, "rename")
         self.assertEqual(existing, "Inception (2010)")
 
+    def test_find_library_match_title_only_existing(self):
+        """Library has a title-only folder like 'Send Help' — should match
+        the staging folder 'Send Help (2026) {imdb-tt...}' as rename."""
+        os.makedirs(os.path.join(self.library, "Send Help"))
+        kind, existing = medianame._find_library_match(
+            self.library, "Send Help (2026) {imdb-tt8036976}")
+        self.assertEqual(kind, "rename")
+        self.assertEqual(existing, "Send Help")
+
+    def test_find_library_match_different_year_is_not_match(self):
+        """Two movies sharing a title but different years → no match."""
+        os.makedirs(os.path.join(self.library, "The Crow (1994)"))
+        kind, _ = medianame._find_library_match(
+            self.library, "The Crow (2024) {imdb-tt1}")
+        self.assertIsNone(kind)
+
+    def test_find_library_match_different_tag_same_year(self):
+        """Same title+year, different ID tag → rename."""
+        os.makedirs(os.path.join(self.library, "Inception (2010) {imdb-ttA}"))
+        kind, existing = medianame._find_library_match(
+            self.library, "Inception (2010) {imdb-ttB}")
+        self.assertEqual(kind, "rename")
+        self.assertEqual(existing, "Inception (2010) {imdb-ttA}")
+
     def test_find_library_match_none(self):
         os.makedirs(os.path.join(self.library, "Other Film (2020)"))
         kind, existing = medianame._find_library_match(
             self.library, "Inception (2010) {imdb-tt1375666}")
         self.assertIsNone(kind)
         self.assertIsNone(existing)
+
+    def test_split_title_year(self):
+        self.assertEqual(
+            medianame._split_title_year("Inception (2010) {imdb-tt1375666}"),
+            ("Inception", 2010))
+        self.assertEqual(
+            medianame._split_title_year("Inception (2010)"),
+            ("Inception", 2010))
+        self.assertEqual(
+            medianame._split_title_year("Send Help"),
+            ("Send Help", None))
+        self.assertEqual(
+            medianame._split_title_year("Send Help (2026) [imdbid-tt1]"),
+            ("Send Help", 2026))
 
     # --- plan generation ---------------------------------------------------
 
@@ -1909,6 +1947,21 @@ class TestPublishFeature(unittest.TestCase):
         medianame.SERIES_LIBRARY_PATH = None
         # Should print an error and return without raising
         medianame.process_publish()
+
+    def test_predict_publish_plan_title_only_match(self):
+        """Verify the predicted plan catches 'Send Help' → 'Send Help (2026)…'.
+        This is the regression case from the user report."""
+        os.makedirs(os.path.join(self.library, "Send Help"))
+        name = "Send Help (2026) {imdb-tt8036976}"
+        scan_plan = [{
+            "target_path": os.path.join(self.staging, name),
+            "folder_name": name,
+            "media_type": "movie",
+        }]
+        predicted = medianame._predict_publish_plan(scan_plan)
+        self.assertEqual(len(predicted), 1)
+        self.assertEqual(predicted[0]["match"], "rename")
+        self.assertEqual(predicted[0]["existing_name"], "Send Help")
 
 
 if __name__ == "__main__":
