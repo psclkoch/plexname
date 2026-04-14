@@ -190,12 +190,19 @@ Only folders carrying a medianame ID tag (`{imdb-…}`, `{tmdb-…}`, `[imdbid-�
 
 Two read-only commands help you keep an existing library clean without touching any files:
 
-**`medianame namecheck [<path>]`** — audit one or both library roots and flag folders that don't follow medianame conventions. When no path is given, both configured library roots are scanned. Reports:
+**`medianame namecheck [<path>]`** — audit one or both library roots and flag folders that don't follow medianame conventions. When no path is given, the configured **library** folders (`movie_library_path` / `series_library_path` from setup steps 11/12) are scanned — these are what Plex/Jellyfin actually indexes. If no library paths are set, the working folders are used as a fallback. Reports:
 
 - Folders without a medianame ID tag (`Inception (2010)` with no `{imdb-…}` / `[imdbid-…]`)
 - TV seasons whose episode count doesn't match TMDB (missing episodes)
 - Orphan subtitle files (`.srt` with no matching video in the same folder)
 - Duplicate IDs — the same `tt…` / TMDB ID appearing in two folders
+
+After the report, namecheck offers an interactive remediation loop. For each finding you can choose:
+
+- `[f]` **fix** — for _missing tag_: search TMDB, confirm a match, rename the folder in place. For _orphan subtitle_: delete the file. (Not available for season gaps or duplicate IDs — those need a human decision.)
+- `[i]` **ignore permanently** — persist the folder name to `namecheck_ignore` in your config. Future runs silently skip it.
+- `[s]` **skip this run** — default (press Enter). Nothing changes.
+- `[a]` **abort** — stop the loop and leave the rest untouched.
 
 **`medianame healthcheck`** — smoke-test your installation:
 
@@ -264,6 +271,7 @@ New config fields introduced in later versions fall back to sensible defaults �
 - v1.3.0 — `movie_library_path`, `series_library_path` (optional publish targets)
 - v1.4.0 — OMDb API is no longer used; the legacy `omdb_api_key` in existing configs is ignored and can be removed
 - v1.5.0 — no new config fields; adds `namecheck` + `healthcheck` commands
+- v1.5.1 — `namecheck_ignore` (persisted per-folder skip list used by `namecheck`)
 
 ### From plexname (v1.0)
 

@@ -1421,6 +1421,11 @@ def process_scan(source_path=None, operation=None, preset_override=None,
 MOVIE_LIBRARY_PATH = None
 SERIES_LIBRARY_PATH = None
 
+# Folder names (case-insensitive) to skip during `namecheck`. Populated by
+# `_load_config`; mutated by `_add_to_namecheck_ignore` when the user picks
+# "[i] ignore permanently" in the interactive remediation flow.
+NAMECHECK_IGNORE = set()
+
 # Files below this size skip the progress indicator for cross-FS copies.
 _PROGRESS_MIN_BYTES = 100 * 1024 * 1024  # 100 MB
 # Block size used by the progress-aware copy.
@@ -2400,10 +2405,13 @@ def _show_help():
         "  medianame scan --no-publish    Scan: skip publish step this run",
         "  medianame publish [<path>]     Move tag-named folders into the",
         "                                 configured library (setup 11/12).",
-        "  medianame namecheck [<path>]   Read-only audit: flag folders with",
-        "                                 missing/malformed ID tags, TV",
-        "                                 seasons with missing episodes,",
-        "                                 orphan subtitles, duplicate IDs.",
+        "  medianame namecheck [<path>]   Audit the library (defaults to the",
+        "                                 library folders from setup 11/12;",
+        "                                 falls back to the working folders).",
+        "                                 Flags missing ID tags, incomplete",
+        "                                 TV seasons, orphan subtitles, and",
+        "                                 duplicate IDs. Offers interactive",
+        "                                 fix / ignore-permanently / skip.",
         "  medianame healthcheck          Verify setup: config, TMDB token,",
         "                                 paths, dependencies.",
         "  medianame setup                (Re)configure API keys, paths, preset",
@@ -2452,6 +2460,11 @@ def _load_config():
     # Optional library paths (empty string = disabled)
     MOVIE_LIBRARY_PATH = cfg.get("movie_library_path") or None
     SERIES_LIBRARY_PATH = cfg.get("series_library_path") or None
+    # Folders that namecheck should skip permanently (user-curated).
+    global NAMECHECK_IGNORE
+    NAMECHECK_IGNORE = {str(e).strip().lower()
+                         for e in (cfg.get("namecheck_ignore") or [])
+                         if str(e).strip()}
 
 
 # ===========================================================================
@@ -2604,8 +2617,15 @@ def _namecheck_folder(folder_path, folder_name, is_tv_root):
 def _iter_namecheck_roots(explicit_path):
     """
     Decide which root folder(s) to scan. Returns a list of
-    (path, is_tv) tuples. Explicit path → auto-detect type from content;
-    else scan both configured paths.
+    (path, is_tv) tuples.
+
+    Priority:
+      1. Explicit path → auto-detect type from content.
+      2. Configured library paths (MOVIE_LIBRARY_PATH / SERIES_LIBRARY_PATH)
+         — these are what Plex/Jellyfin actually indexes, so they're the
+         right default target for an audit.
+      3. Fall back to the working paths (MOVIE_PATH / SERIES_PATH) when no
+         library paths are configured (single-folder setups).
     """
     if explicit_path:
         # Heuristic: if any immediate subfolder contains a Season NN/ folder,
@@ -2626,29 +2646,190 @@ def _iter_namecheck_roots(explicit_path):
         except OSError:
             pass
         return [(explicit_path, is_tv)]
+
     roots = []
-    if MOVIE_PATH and os.path.isdir(MOVIE_PATH):
-        roots.append((MOVIE_PATH, False))
-    if (SERIES_PATH and SERIES_PATH != MOVIE_PATH
-            and os.path.isdir(SERIES_PATH)):
-        roots.append((SERIES_PATH, True))
+    seen = set()
+    movie_root = MOVIE_LIBRARY_PATH or MOVIE_PATH
+    series_root = SERIES_LIBRARY_PATH or SERIES_PATH
+    if movie_root and os.path.isdir(movie_root):
+        roots.append((movie_root, False))
+        seen.add(os.path.abspath(movie_root))
+    if (series_root and os.path.isdir(series_root)
+            and os.path.abspath(series_root) not in seen):
+        roots.append((series_root, True))
     return roots
 
 
-def process_namecheck(path=None):
+def _add_to_namecheck_ignore(name):
     """
-    Read-only audit of an existing library. Prints a report listing
-    folders with naming issues. Nothing is modified.
+    Persist `name` to the config's namecheck_ignore list and update the
+    in-memory NAMECHECK_IGNORE set.
+    """
+    global NAMECHECK_IGNORE
+    import config as _config
+    cfg = _config.load_config() or {}
+    extras = list(cfg.get("namecheck_ignore") or [])
+    if not any(e.strip().lower() == name.strip().lower() for e in extras):
+        extras.append(name)
+        cfg["namecheck_ignore"] = extras
+        _config.save_config(cfg)
+    NAMECHECK_IGNORE = NAMECHECK_IGNORE | {name.strip().lower()}
+    print(f"      ✅ Added to namecheck ignore list: {name}")
+
+
+def _fix_missing_tag(folder_path, folder_name, root, is_tv):
+    """
+    Interactive fix for a folder missing its medianame ID tag.
+    Searches TMDB using the parsed title/year, confirms with the user,
+    then renames the folder in place. Returns True on success.
+    """
+    title, year = _split_title_year(folder_name)
+    if not title:
+        print("      ⚠️ Could not parse a title from the folder name.")
+        return False
+    print(f"      🔍 Searching TMDB for: {title}"
+          + (f" ({year})" if year else ""))
+    result = search_by_title(title, year_hint=year)
+    if not result:
+        print("      Skipped.")
+        return False
+    entry_id, media_type, _ = result
+    if media_type == "tv":
+        data = get_tmdb_details(entry_id, "tv")
+    else:
+        data = get_movie_data(entry_id)
+    if not data or data.get("Response") != "True":
+        print("      ❌ Could not fetch TMDB details.")
+        return False
+
+    clean_title, clean_year = _sanitize_title_year(
+        data["Title"], data.get("Year", ""))
+    want_id_type = _resolve_naming(media_type, NAMING_PRESET)
+    id_value = _resolve_id_value(entry_id, media_type, want_id_type, data)
+    if not id_value:
+        print(f"      ❌ Could not resolve {want_id_type} ID.")
+        return False
+    new_name = format_folder_name(clean_title, clean_year,
+                                   want_id_type, id_value, NAMING_PRESET)
+    new_path = os.path.join(root, new_name)
+
+    if os.path.abspath(new_path) == os.path.abspath(folder_path):
+        print("      ℹ️ Folder already carries the correct name.")
+        return True
+    if os.path.exists(new_path):
+        print(f"      ⚠️ Target already exists: {new_name} — not renaming.")
+        return False
+    try:
+        answer = input(f"      Rename to: {new_name}? "
+                       f"[Enter = yes, n = cancel]: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return False
+    if answer not in ("", "y", "yes", "j", "ja"):
+        print("      Skipped.")
+        return False
+    try:
+        os.rename(folder_path, new_path)
+    except OSError as e:
+        print(f"      ❌ Rename failed: {e}")
+        return False
+    print(f"      ✅ Renamed → {new_name}")
+    return True
+
+
+def _fix_orphan_subtitle(folder_path, detail):
+    """
+    Offer to delete an orphan subtitle file. `detail` looks like
+    "Other.ger.srt (no matching video)" or "Season 01/foo.srt (…)".
+    """
+    # Strip the trailing " (no matching video)" suffix to get the path
+    rel = detail.rsplit(" (", 1)[0].strip()
+    target = os.path.join(folder_path, rel)
+    if not os.path.isfile(target):
+        print(f"      ⚠️ File not found: {target}")
+        return False
+    try:
+        answer = input(f"      Delete {rel}? "
+                       f"[Enter = yes, n = cancel]: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return False
+    if answer not in ("", "y", "yes", "j", "ja"):
+        print("      Skipped.")
+        return False
+    try:
+        os.remove(target)
+    except OSError as e:
+        print(f"      ❌ Delete failed: {e}")
+        return False
+    print(f"      ✅ Deleted {rel}")
+    return True
+
+
+# Findings that expose a [f]ix action and which handler implements it.
+_FIXABLE_KINDS = {"missing-tag", "orphan-subtitle"}
+
+
+def _remediate_finding(root, folder_path, folder_name, is_tv, finding):
+    """
+    Prompt the user with [f/i/s] options for one finding.
+
+    Returns one of: "fixed", "ignored", "skipped", "abort".
+    """
+    kind = finding["kind"]
+    fixable = kind in _FIXABLE_KINDS
+    options = []
+    if fixable:
+        options.append("[f]ix")
+    options.extend(["[i]gnore permanently", "[s]kip this run", "[a]bort"])
+    prompt = f"      Action — {' / '.join(options)} (Enter = skip): "
+    try:
+        answer = input(prompt).strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return "abort"
+    if answer == "a":
+        return "abort"
+    if answer == "i":
+        _add_to_namecheck_ignore(folder_name)
+        return "ignored"
+    if answer in ("", "s"):
+        return "skipped"
+    if answer == "f" and fixable:
+        if kind == "missing-tag":
+            ok = _fix_missing_tag(folder_path, folder_name, root, is_tv)
+        elif kind == "orphan-subtitle":
+            ok = _fix_orphan_subtitle(folder_path, finding["detail"])
+        else:
+            ok = False
+        return "fixed" if ok else "skipped"
+    print(f"      ⚠️ Unknown option: {answer!r} — treating as skip.")
+    return "skipped"
+
+
+def process_namecheck(path=None, interactive=True):
+    """
+    Read-only audit of an existing library.
+
+    By default, scans the *library* paths (movie_library_path,
+    series_library_path) because those are what Plex/Jellyfin actually
+    indexes. Falls back to the working paths when no library is
+    configured. `path` overrides everything.
+
+    When `interactive` is True and any findings exist, a remediation
+    loop offers per-finding choices: fix / ignore permanently / skip.
     """
     roots = _iter_namecheck_roots(path)
     if not roots:
-        print("❌ No folder to scan. Configure movie_path / series_path "
+        print("❌ No folder to scan. Configure movie_library_path / "
+              "series_library_path (or movie_path / series_path) "
               "or pass a path explicitly.")
         return
 
     total_folders = 0
-    total_findings = 0
-    duplicate_ids = {}
+    ignored_folders = 0
+    all_reports = []      # list of (root, is_tv, folder_path, folder_name, findings)
+    duplicate_ids = {}    # id → [(root, relpath), …]
 
     for root, is_tv in roots:
         kind_label = "TV" if is_tv else "Movies"
@@ -2659,46 +2840,98 @@ def process_namecheck(path=None):
             print(f"  ❌ Cannot read: {e}")
             continue
 
-        folder_reports = []  # (name, findings)
         for name in entries:
             full = os.path.join(root, name)
             if not os.path.isdir(full) or name.startswith("."):
+                continue
+            if name.strip().lower() in NAMECHECK_IGNORE:
+                ignored_folders += 1
                 continue
             total_folders += 1
             id_type, id_value = _extract_id_from_tag(name)
             if id_type:
                 key = f"{id_type}-{id_value}"
                 duplicate_ids.setdefault(key, []).append(
-                    os.path.relpath(full, root))
+                    (root, os.path.relpath(full, root)))
             findings = _namecheck_folder(full, name, is_tv)
             if findings:
-                folder_reports.append((name, findings))
-                total_findings += len(findings)
+                all_reports.append((root, is_tv, full, name, findings))
 
-        if folder_reports:
-            print()
-            for name, findings in folder_reports:
-                print(f" 📁 {name}")
-                for f in findings:
-                    print(f"    └─ {f['detail']}")
-        print()
-
-    # Cross-root duplicate IDs
+    # Cross-root duplicate IDs — turn into synthetic findings on the
+    # *second and later* folders so remediation can offer "ignore" on each.
+    dup_findings = []
     dups = {k: v for k, v in duplicate_ids.items() if len(v) > 1}
-    if dups:
-        print("⚠️  Duplicate IDs across folders:")
-        for key, paths in sorted(dups.items()):
-            print(f"   {key}:")
-            for p in paths:
-                print(f"     - {p}")
-            total_findings += len(paths) - 1
-        print()
+    for key, occurrences in sorted(dups.items()):
+        peers = ", ".join(p for _, p in occurrences)
+        for root, rel in occurrences:
+            full = os.path.join(root, rel)
+            dup_findings.append((root, None, full, rel,
+                                 [{"kind": "duplicate-id",
+                                   "detail": f"duplicate ID {key} "
+                                             f"(also at: {peers})"}]))
 
+    # Print all findings up-front for a clean overview
+    total_findings = 0
+    if all_reports or dup_findings:
+        print()
+    for root, _is_tv, _full, name, findings in all_reports:
+        print(f" 📁 {name}")
+        for f in findings:
+            print(f"    └─ {f['detail']}")
+        total_findings += len(findings)
+    if dup_findings:
+        print()
+        print(" ⚠️  Duplicate IDs across folders:")
+        for _r, _t, _f, rel, findings in dup_findings:
+            print(f"    📁 {rel}")
+            for f in findings:
+                print(f"       └─ {f['detail']}")
+            total_findings += len(findings)
+
+    print()
+    suffix = (f" (skipping {ignored_folders} previously-ignored folder(s))"
+              if ignored_folders else "")
     if total_findings == 0:
-        print(f"✅ {total_folders} folder(s) checked — all clean.")
-    else:
-        print(f"⚠️  {total_findings} issue(s) across "
-              f"{total_folders} folder(s) checked.")
+        print(f"✅ {total_folders} folder(s) checked — all clean.{suffix}")
+        return
+    print(f"⚠️  {total_findings} issue(s) across "
+          f"{total_folders} folder(s) checked.{suffix}")
+
+    if not interactive:
+        return
+
+    try:
+        go = input("\nRemediate interactively? "
+                   "[Enter = yes, n = no]: ").strip().lower()
+    except (EOFError, KeyboardInterrupt, OSError):
+        print()
+        return
+    if go not in ("", "y", "yes", "j", "ja"):
+        return
+
+    all_to_process = all_reports + dup_findings
+    for root, is_tv, full, name, findings in all_to_process:
+        if not os.path.isdir(full):
+            # Folder was renamed by a previous fix in this loop
+            continue
+        if name.strip().lower() in NAMECHECK_IGNORE:
+            continue
+        print()
+        print(f" 📁 {name}")
+        aborted = False
+        for finding in findings:
+            print(f"    └─ {finding['detail']}")
+            outcome = _remediate_finding(root, full, name, is_tv, finding)
+            if outcome == "abort":
+                aborted = True
+                break
+            if outcome in ("ignored", "fixed"):
+                # Further findings on the same folder are moot after
+                # a rename or permanent-ignore: break out.
+                break
+        if aborted:
+            print("\nAborted.")
+            return
 
 
 # ===========================================================================

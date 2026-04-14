@@ -2094,11 +2094,19 @@ class TestNamecheck(unittest.TestCase):
         self._orig = {
             "MOVIE_PATH": medianame.MOVIE_PATH,
             "SERIES_PATH": medianame.SERIES_PATH,
+            "MOVIE_LIBRARY_PATH": medianame.MOVIE_LIBRARY_PATH,
+            "SERIES_LIBRARY_PATH": medianame.SERIES_LIBRARY_PATH,
             "TMDB_TOKEN": medianame.TMDB_TOKEN,
+            "NAMECHECK_IGNORE": set(medianame.NAMECHECK_IGNORE),
+            "NAMING_PRESET": medianame.NAMING_PRESET,
         }
         medianame.MOVIE_PATH = self.root
         medianame.SERIES_PATH = self.series_root
+        medianame.MOVIE_LIBRARY_PATH = None
+        medianame.SERIES_LIBRARY_PATH = None
         medianame.TMDB_TOKEN = None  # disable TMDB calls unless patched
+        medianame.NAMECHECK_IGNORE = set()
+        medianame.NAMING_PRESET = "plex"
         medianame._movie_cache.clear()
         medianame._tmdb_cache.clear()
 
@@ -2138,7 +2146,7 @@ class TestNamecheck(unittest.TestCase):
     def test_namecheck_missing_tag(self):
         os.makedirs(os.path.join(self.root, "Some Movie (2020)"))
         with patch("builtins.print") as mock_print:
-            medianame.process_namecheck(path=self.root)
+            medianame.process_namecheck(path=self.root, interactive=False)
         output = "\n".join(str(c.args[0]) for c in mock_print.call_args_list
                            if c.args)
         self.assertIn("Some Movie (2020)", output)
@@ -2150,7 +2158,7 @@ class TestNamecheck(unittest.TestCase):
         self._mkfile(os.path.join(folder, "Movie.mkv"), 1024)
         self._mkfile(os.path.join(folder, "Other.ger.srt"), 100)
         with patch("builtins.print") as mock_print:
-            medianame.process_namecheck(path=self.root)
+            medianame.process_namecheck(path=self.root, interactive=False)
         output = "\n".join(str(c.args[0]) for c in mock_print.call_args_list
                            if c.args)
         self.assertIn("Other.ger.srt", output)
@@ -2161,7 +2169,7 @@ class TestNamecheck(unittest.TestCase):
         self._mkfile(os.path.join(folder, "Movie.mkv"), 1024)
         self._mkfile(os.path.join(folder, "Movie.ger.srt"), 100)
         with patch("builtins.print") as mock_print:
-            medianame.process_namecheck(path=self.root)
+            medianame.process_namecheck(path=self.root, interactive=False)
         output = "\n".join(str(c.args[0]) for c in mock_print.call_args_list
                            if c.args)
         self.assertNotIn("Movie.ger.srt", output)
@@ -2181,7 +2189,8 @@ class TestNamecheck(unittest.TestCase):
                        {"season_number": 1, "episode_count": 7},
                    ]}):
             with patch("builtins.print") as mock_print:
-                medianame.process_namecheck(path=self.series_root)
+                medianame.process_namecheck(path=self.series_root,
+                                             interactive=False)
         output = "\n".join(str(c.args[0]) for c in mock_print.call_args_list
                            if c.args)
         self.assertIn("Season 01", output)
@@ -2191,7 +2200,7 @@ class TestNamecheck(unittest.TestCase):
         os.makedirs(os.path.join(self.root, "Movie A (2020) {imdb-tt1}"))
         os.makedirs(os.path.join(self.root, "Movie A copy (2020) {imdb-tt1}"))
         with patch("builtins.print") as mock_print:
-            medianame.process_namecheck(path=self.root)
+            medianame.process_namecheck(path=self.root, interactive=False)
         output = "\n".join(str(c.args[0]) for c in mock_print.call_args_list
                            if c.args)
         self.assertIn("Duplicate IDs", output)
@@ -2203,10 +2212,123 @@ class TestNamecheck(unittest.TestCase):
         self._mkfile(os.path.join(folder, "Movie.mkv"), 1024)
         self._mkfile(os.path.join(folder, "Movie.ger.srt"), 100)
         with patch("builtins.print") as mock_print:
-            medianame.process_namecheck(path=self.root)
+            medianame.process_namecheck(path=self.root, interactive=False)
         output = "\n".join(str(c.args[0]) for c in mock_print.call_args_list
                            if c.args)
         self.assertIn("all clean", output)
+
+    # --- v1.5.1: default to library paths + remediation -------------------
+
+    def test_namecheck_defaults_to_library_paths(self):
+        """When library paths are configured, they win over working paths."""
+        library_movie = tempfile.mkdtemp()
+        library_series = tempfile.mkdtemp()
+        try:
+            # Canary folders in *working* paths — must NOT be reported
+            os.makedirs(os.path.join(self.root, "WorkingCanary (2020)"))
+            os.makedirs(os.path.join(self.series_root, "WorkingCanarySeries"))
+            # Actual issues only in library paths
+            os.makedirs(os.path.join(library_movie, "LibraryMovie (2020)"))
+            medianame.MOVIE_LIBRARY_PATH = library_movie
+            medianame.SERIES_LIBRARY_PATH = library_series
+
+            with patch("builtins.print") as mock_print:
+                medianame.process_namecheck(interactive=False)
+            output = "\n".join(str(c.args[0])
+                                for c in mock_print.call_args_list if c.args)
+            self.assertIn("LibraryMovie (2020)", output)
+            self.assertNotIn("WorkingCanary", output)
+        finally:
+            shutil.rmtree(library_movie, ignore_errors=True)
+            shutil.rmtree(library_series, ignore_errors=True)
+
+    def test_namecheck_falls_back_to_working_paths(self):
+        """No library paths configured → scan working paths."""
+        os.makedirs(os.path.join(self.root, "Working (2020)"))
+        medianame.MOVIE_LIBRARY_PATH = None
+        medianame.SERIES_LIBRARY_PATH = None
+        with patch("builtins.print") as mock_print:
+            medianame.process_namecheck(interactive=False)
+        output = "\n".join(str(c.args[0]) for c in mock_print.call_args_list
+                           if c.args)
+        self.assertIn("Working (2020)", output)
+
+    def test_namecheck_skips_entries_in_ignore_list(self):
+        """Folders listed in NAMECHECK_IGNORE are not reported."""
+        os.makedirs(os.path.join(self.root, "Annoying (2020)"))
+        os.makedirs(os.path.join(self.root, "Relevant (2020)"))
+        medianame.NAMECHECK_IGNORE = {"annoying (2020)"}
+        with patch("builtins.print") as mock_print:
+            medianame.process_namecheck(path=self.root, interactive=False)
+        output = "\n".join(str(c.args[0]) for c in mock_print.call_args_list
+                           if c.args)
+        self.assertNotIn("Annoying (2020)", output)
+        self.assertIn("Relevant (2020)", output)
+        self.assertIn("skipping 1 previously-ignored", output)
+
+    def test_remediation_fix_renames_missing_tag(self):
+        """[f] on missing-tag → TMDB lookup → folder renamed."""
+        os.makedirs(os.path.join(self.root, "Inception (2010)"))
+        tmdb_data = {"Response": "True", "Title": "Inception",
+                     "Year": "2010", "imdbID": "tt1375666"}
+        # Inputs: remediate? yes; action: f; confirm rename: yes
+        with patch("medianame.search_by_title",
+                   return_value=("tt1375666", "movie", None)), \
+             patch("medianame.get_movie_data", return_value=tmdb_data), \
+             patch("builtins.input", side_effect=["", "f", ""]):
+            medianame.process_namecheck(path=self.root, interactive=True)
+        # Old folder gone, new tagged folder exists
+        self.assertFalse(os.path.isdir(
+            os.path.join(self.root, "Inception (2010)")))
+        self.assertTrue(os.path.isdir(
+            os.path.join(self.root, "Inception (2010) {imdb-tt1375666}")))
+
+    def test_remediation_ignore_persists_name(self):
+        """[i] on any finding calls _add_to_namecheck_ignore with the name."""
+        os.makedirs(os.path.join(self.root, "Weird Folder"))
+        with patch("medianame._add_to_namecheck_ignore") as mock_add, \
+             patch("builtins.input", side_effect=["", "i"]):
+            medianame.process_namecheck(path=self.root, interactive=True)
+        mock_add.assert_called_once_with("Weird Folder")
+
+    def test_remediation_skip_leaves_folder_alone(self):
+        """[s] (or empty) on any finding: no changes, no ignore-list update."""
+        os.makedirs(os.path.join(self.root, "Some Movie (2020)"))
+        with patch("medianame._add_to_namecheck_ignore") as mock_add, \
+             patch("builtins.input", side_effect=["", "s"]):
+            medianame.process_namecheck(path=self.root, interactive=True)
+        mock_add.assert_not_called()
+        self.assertTrue(os.path.isdir(
+            os.path.join(self.root, "Some Movie (2020)")))
+
+    def test_remediation_abort_stops_loop(self):
+        """[a] breaks out of the loop without touching later folders."""
+        os.makedirs(os.path.join(self.root, "A (2020)"))
+        os.makedirs(os.path.join(self.root, "B (2020)"))
+        with patch("medianame._add_to_namecheck_ignore") as mock_add, \
+             patch("builtins.input", side_effect=["", "a"]):
+            medianame.process_namecheck(path=self.root, interactive=True)
+        mock_add.assert_not_called()
+
+    def test_remediation_declines_loop_via_no(self):
+        """User answers 'n' at the top-level prompt → no remediation."""
+        os.makedirs(os.path.join(self.root, "Some (2020)"))
+        with patch("builtins.input", side_effect=["n"]) as mock_input, \
+             patch("medianame._add_to_namecheck_ignore") as mock_add:
+            medianame.process_namecheck(path=self.root, interactive=True)
+        mock_add.assert_not_called()
+        self.assertEqual(mock_input.call_count, 1)
+
+    def test_fix_orphan_subtitle_deletes_file(self):
+        folder = os.path.join(self.root, "Movie (2020) {imdb-tt1}")
+        os.makedirs(folder)
+        self._mkfile(os.path.join(folder, "Movie.mkv"), 1024)
+        orphan = os.path.join(folder, "Random.ger.srt")
+        self._mkfile(orphan, 100)
+        # Inputs: remediate? yes; action: f; confirm delete: yes
+        with patch("builtins.input", side_effect=["", "f", ""]):
+            medianame.process_namecheck(path=self.root, interactive=True)
+        self.assertFalse(os.path.exists(orphan))
 
 
 class TestHealthcheck(unittest.TestCase):
