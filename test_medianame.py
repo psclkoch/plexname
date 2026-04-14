@@ -1301,6 +1301,98 @@ class TestScanFeature(unittest.TestCase):
         os.makedirs(os.path.dirname(path), exist_ok=True)
         return path
 
+    # --- _choose_scan_source -----------------------------------------------
+
+    def test_choose_scan_source_custom_path(self):
+        """Option [3] prompts for a path and returns it if it's a directory."""
+        custom = tempfile.mkdtemp()
+        try:
+            with patch("builtins.input", side_effect=["3", custom]):
+                result = medianame._choose_scan_source()
+            self.assertEqual(result, custom)
+        finally:
+            shutil.rmtree(custom, ignore_errors=True)
+
+    def test_choose_scan_source_custom_path_invalid(self):
+        """Option [3] with a non-directory path returns None."""
+        with patch("builtins.input",
+                   side_effect=["3", "/nonexistent/path/that/does/not/exist"]):
+            result = medianame._choose_scan_source()
+        self.assertIsNone(result)
+
+    def test_choose_scan_source_option_1(self):
+        with patch("builtins.input", return_value="1"):
+            result = medianame._choose_scan_source()
+        self.assertEqual(result, medianame.MOVIE_PATH)
+
+    # --- _print_scan_plan --------------------------------------------------
+
+    def test_print_scan_plan_shows_cleanup_note_for_folder_move(self):
+        """Plan print should clearly announce source-folder cleanup on move."""
+        import io, contextlib
+        plan = [{
+            "source": "/src/Movie.2020.BluRay",
+            "source_name": "Movie.2020.BluRay",
+            "target_path": "/lib/Movie (2020) {imdb-tt1}",
+            "folder_name": "Movie (2020) {imdb-tt1}",
+            "media_type": "movie",
+            "seasons": None,
+            "parsed_season": None,
+            "media_files": [("/src/Movie.2020.BluRay/movie.mkv", "video")],
+        }]
+        buf = io.StringIO()
+        # Make the source look like a dir
+        with patch("os.path.isdir", return_value=True), \
+             contextlib.redirect_stdout(buf):
+            medianame._print_scan_plan(plan, "move")
+        out = buf.getvalue()
+        self.assertIn("Source folder:", out)
+        self.assertIn("/src/Movie.2020.BluRay", out)
+        self.assertIn("Target folder:", out)
+        self.assertIn("Cleanup:", out)
+        self.assertIn("deleted after the move", out)
+        self.assertIn("movie.mkv", out)
+
+    def test_print_scan_plan_single_file_source(self):
+        import io, contextlib
+        plan = [{
+            "source": "/src/Movie.2020.mkv",
+            "source_name": "Movie.2020.mkv",
+            "target_path": "/lib/Movie (2020) {imdb-tt1}",
+            "folder_name": "Movie (2020) {imdb-tt1}",
+            "media_type": "movie",
+            "seasons": None,
+            "parsed_season": None,
+            "media_files": [("/src/Movie.2020.mkv", "video")],
+        }]
+        buf = io.StringIO()
+        with patch("os.path.isdir", return_value=False), \
+             contextlib.redirect_stdout(buf):
+            medianame._print_scan_plan(plan, "move")
+        out = buf.getvalue()
+        self.assertIn("Source file:", out)
+        self.assertIn("no", out.lower())  # "no folder to clean up"
+
+    def test_print_scan_plan_copy_has_no_cleanup_note(self):
+        import io, contextlib
+        plan = [{
+            "source": "/src/Movie.2020",
+            "source_name": "Movie.2020",
+            "target_path": "/lib/Movie (2020) {imdb-tt1}",
+            "folder_name": "Movie (2020) {imdb-tt1}",
+            "media_type": "movie",
+            "seasons": None,
+            "parsed_season": None,
+            "media_files": [("/src/Movie.2020/m.mkv", "video")],
+        }]
+        buf = io.StringIO()
+        with patch("os.path.isdir", return_value=True), \
+             contextlib.redirect_stdout(buf):
+            medianame._print_scan_plan(plan, "copy")
+        out = buf.getvalue()
+        self.assertNotIn("Cleanup:", out)
+        self.assertIn("Copy 1 file(s):", out)
+
     def test_execute_plan_copies_files(self):
         src = os.path.join(self.source_dir, "Movie.2020.mkv")
         self._write_file(src, 1024)  # small; we're bypassing classification

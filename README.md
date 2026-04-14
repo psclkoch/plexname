@@ -110,7 +110,7 @@ medianame help                   # Show detailed help
 If you already have raw downloads like `Movie.2011.2160p.BluRay.x265-SceneGROUP.mkv` or folders like `TV.Show.S01.1080p.REMUX-SceneGROUP/`, scan mode parses the release names, looks each title up on TMDB with confirmation, creates the correctly-named library folder, and moves (or copies) the relevant media files into it.
 
 ```bash
-medianame scan                         # Interactive: pick movie or series folder
+medianame scan                         # Interactive: pick movie / series / custom path
 medianame scan ~/Downloads             # Scan a specific folder
 medianame scan --copy <path>           # Keep the source (default is move)
 medianame scan --max-age-days 7 <path> # Only look at entries modified in the last 7 days

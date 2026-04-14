@@ -728,8 +728,9 @@ def process_list(dry_run=False, interactive=False, output_path=None, input_file=
             if not _can_write_to(p):
                 print(f"❌ ABORT: No write permissions for '{p}'.")
                 return
-        answer = input(f"\nCreate {len(to_create)} folder(s)? (y/n): ").strip().lower()
-        if answer in ("j", "ja", "y", "yes"):
+        answer = input(f"\nCreate {len(to_create)} folder(s)? "
+                       f"[Enter = yes, n = cancel]: ").strip().lower()
+        if answer in ("", "j", "ja", "y", "yes"):
             for folder_name, full_path, seasons in to_create:
                 os.makedirs(full_path)
                 print(f"✅ Created: {folder_name}")
@@ -929,16 +930,22 @@ def scan_source(source_path, max_age_days=0):
 
 def _choose_scan_source():
     """
-    Ask the user which configured library path to scan.
+    Ask the user which folder to scan.
+
+    Options:
+        [1] Configured movie folder
+        [2] Configured TV show folder
+        [3] Custom path (prompted interactively)
 
     Returns:
         Path string, or None if the user cancelled.
     """
     print("Which folder should I scan?")
-    print(f"  [1] Movie folder:  {MOVIE_PATH}")
-    print(f"  [2] TV show folder: {SERIES_PATH}")
+    print(f"  [1] Movie folder:    {MOVIE_PATH}")
+    print(f"  [2] TV show folder:  {SERIES_PATH}")
+    print( "  [3] Custom path (enter manually)")
     try:
-        choice = input("Pick 1 or 2 (empty = cancel): ").strip()
+        choice = input("Pick 1, 2, or 3 (empty = cancel): ").strip()
     except (EOFError, KeyboardInterrupt):
         print()
         return None
@@ -946,6 +953,19 @@ def _choose_scan_source():
         return MOVIE_PATH
     if choice == "2":
         return SERIES_PATH
+    if choice == "3":
+        try:
+            raw = input("   Path: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return None
+        if not raw:
+            return None
+        path = os.path.expanduser(raw)
+        if not os.path.isdir(path):
+            print(f"❌ Not a directory: {path}")
+            return None
+        return path
     return None
 
 
@@ -1154,6 +1174,53 @@ def execute_scan_plan(plan, operation="move"):
     return counts
 
 
+def _print_scan_plan(plan, operation):
+    """
+    Render a human-readable summary of the scan plan.
+
+    For each item, print the source (file or folder), the target folder,
+    the list of files being moved/copied, and — for move — an explicit
+    note that the source folder will be deleted afterwards.
+    """
+    verb = "Move" if operation == "move" else "Copy"
+    divider = "=" * 60
+    print()
+    print(divider)
+    print(f"Plan ({operation}) — {len(plan)} item(s):")
+    print(divider)
+    for idx, entry in enumerate(plan, 1):
+        print()
+        print(f"[{idx}] {entry['folder_name']}")
+        source = entry.get("source")
+        source_is_dir = bool(source and os.path.isdir(source))
+        label = "Source folder:" if source_is_dir else "Source file:"
+        print(f"    {label}")
+        print(f"      {source or entry['source_name']}")
+        print(f"    Target folder:")
+        print(f"      {entry['target_path']}")
+        # Group by subdirectory under target (e.g. Season 01 for TV)
+        file_count = len(entry["media_files"])
+        print(f"    {verb} {file_count} file(s):")
+        seen_subdirs = set()
+        for src, kind in entry["media_files"]:
+            dest = _destination_for(entry, src)
+            rel = os.path.relpath(dest, entry["target_path"])
+            subdir = os.path.dirname(rel)
+            if subdir and subdir not in seen_subdirs:
+                seen_subdirs.add(subdir)
+                # subtle hint; per-file lines below will include it anyway
+            print(f"      • {rel}  ({kind})")
+        if operation == "move" and source_is_dir:
+            print(f"    Cleanup: source folder above (incl. any leftover")
+            print(f"             files inside, e.g. .nfo / samples) will be")
+            print(f"             deleted after the move.")
+        elif operation == "move" and not source_is_dir:
+            print(f"    Cleanup: source is a single file — fully moved, no")
+            print(f"             folder to clean up.")
+    print()
+    print(divider)
+
+
 def process_scan(source_path=None, operation=None, preset_override=None,
                  max_age_days=0):
     """
@@ -1193,26 +1260,22 @@ def process_scan(source_path=None, operation=None, preset_override=None,
         return
 
     # Show final plan and confirm
-    print(f"\n{'=' * 50}")
-    print(f"Plan ({op}):")
-    print("=" * 50)
-    for entry in plan:
-        print(f"  {entry['source_name']}")
-        print(f"    → {entry['target_path']}")
-        for src, _ in entry["media_files"]:
-            dest = _destination_for(entry, src)
-            print(f"       {os.path.basename(src)} → {os.path.relpath(dest, entry['target_path'])}")
+    _print_scan_plan(plan, op)
+
     if op == "move":
-        prompt = (f"\nMove {len(plan)} item(s) and delete the original source "
-                  f"folder(s) afterwards? (y/n): ")
+        prompt = (f"\nProceed: move {len(plan)} item(s) and delete the "
+                  f"source folder(s)? [Enter = yes, n = cancel]: ")
     else:
-        prompt = f"\nCopy {len(plan)} item(s)? (y/n): "
+        prompt = (f"\nProceed: copy {len(plan)} item(s)? "
+                  f"[Enter = yes, n = cancel]: ")
     try:
         answer = input(prompt).strip().lower()
     except (EOFError, KeyboardInterrupt):
         print()
         answer = "n"
-    if answer not in ("y", "yes", "j", "ja"):
+    # Enter (empty) = yes; "n" / "no" = cancel; anything else also cancels
+    # to avoid misclicks.
+    if answer not in ("", "y", "yes", "j", "ja"):
         print("Cancelled.")
         return
 
