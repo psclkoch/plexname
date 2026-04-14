@@ -27,4 +27,4 @@ jobs:
           pip install -e .
 
       - name: Run tests
-        run: python -m unittest test_movie_fix -v
+        run: python -m unittest test_medianame -v

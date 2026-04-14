@@ -1,28 +1,54 @@
 """
-Configuration management for plexname.
+Configuration management for medianame.
 
-Stores API keys and paths in ~/.config/plexname/config.json.
+Stores API keys and paths in ~/.config/medianame/config.json.
 On first run, the user is prompted interactively for all values.
+
+Legacy configs under ~/.config/plexname/config.json are migrated
+automatically on first run of v1.1.
 """
 
 import json
 import os
 import stat
 
-CONFIG_DIR = os.path.join(os.path.expanduser("~"), ".config", "plexname")
+CONFIG_DIR = os.path.join(os.path.expanduser("~"), ".config", "medianame")
 CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
 
+# Legacy path from v1.0 (plexname) — used for one-time migration
+LEGACY_CONFIG_DIR = os.path.join(os.path.expanduser("~"), ".config", "plexname")
+LEGACY_CONFIG_PATH = os.path.join(LEGACY_CONFIG_DIR, "config.json")
+
 REQUIRED_KEYS = ["omdb_api_key", "tmdb_token", "movie_path", "series_path"]
+# naming_preset, movie_id_source, series_id_source are optional
+# (v1.0 configs default to plex).
+
+
+def _migrate_legacy_config():
+    """
+    If a legacy plexname config exists and the new one doesn't, copy it over.
+    Runs silently; only prints on actual migration.
+    """
+    if os.path.exists(CONFIG_PATH) or not os.path.exists(LEGACY_CONFIG_PATH):
+        return
+    try:
+        with open(LEGACY_CONFIG_PATH, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return
+    save_config(cfg)
+    print(f"ℹ️ Migrated config from {LEGACY_CONFIG_PATH} → {CONFIG_PATH}")
 
 
 def load_config():
     """
-    Read configuration from ~/.config/plexname/config.json.
+    Read configuration from ~/.config/medianame/config.json.
 
     Returns:
         dict with all config values, or None if the file is missing
         or incomplete.
     """
+    _migrate_legacy_config()
     if not os.path.exists(CONFIG_PATH):
         return None
     try:
@@ -53,7 +79,7 @@ def run_setup():
         dict with the complete configuration.
     """
     print("=" * 50)
-    print("  🎬 plexname — First-time setup")
+    print("  🎬 medianame — First-time setup")
     print("=" * 50)
 
     existing = load_config() or {}
@@ -84,22 +110,55 @@ def run_setup():
 
     # 4. Series path
     print()
-    print("4) Plex TV show folder (root of your series library)")
+    print("4) TV show folder (root of your series library)")
     print("   Example: /Volumes/NAS/TV or /mnt/media/tv")
     default = existing.get("series_path", "")
     series_path = _prompt_value("   Path", default)
+
+    # 5. Naming preset
+    print()
+    print("5) Media server (determines folder naming convention)")
+    print("   plex     → \"Title (Year) {imdb-ttXXX}\"  /  \"Title (Year) {tmdb-XXX}\"")
+    print("   jellyfin → \"Title (Year) [imdbid-ttXXX]\" / \"Title (Year) [tmdbid-XXX]\"")
+    default_preset = existing.get("naming_preset", "plex")
+    preset = _prompt_choice("   Preset (plex/jellyfin)", ["plex", "jellyfin"], default_preset)
+
+    # 6. + 7. ID source (only matters for Jellyfin — Plex is fixed)
+    if preset == "jellyfin":
+        print()
+        print("6) Movie ID source")
+        print("   imdb → use IMDb IDs for movies (default, recommended)")
+        print("   tmdb → use TMDB IDs for movies")
+        default_movie_source = existing.get("movie_id_source", "imdb")
+        movie_id_source = _prompt_choice("   Movie IDs (imdb/tmdb)",
+                                          ["imdb", "tmdb"], default_movie_source)
+
+        print()
+        print("7) TV show ID source")
+        print("   tmdb → use TMDB IDs for TV shows (default, recommended)")
+        print("   imdb → use IMDb IDs for TV shows")
+        default_series_source = existing.get("series_id_source", "tmdb")
+        series_id_source = _prompt_choice("   TV show IDs (imdb/tmdb)",
+                                           ["imdb", "tmdb"], default_series_source)
+    else:
+        # Plex: fixed conventions
+        movie_id_source = "imdb"
+        series_id_source = "tmdb"
 
     cfg = {
         "omdb_api_key": omdb_key,
         "tmdb_token": tmdb_token,
         "movie_path": movie_path,
         "series_path": series_path,
+        "naming_preset": preset,
+        "movie_id_source": movie_id_source,
+        "series_id_source": series_id_source,
     }
 
     save_config(cfg)
     print()
     print(f"✅ Configuration saved: {CONFIG_PATH}")
-    print("   Reconfigure anytime: plexname setup")
+    print("   Reconfigure anytime: medianame setup")
     print()
     return cfg
 
@@ -130,3 +189,14 @@ def _prompt_value(label, default=""):
             if entry:
                 return entry
             print("   Input required.")
+
+
+def _prompt_choice(label, choices, default):
+    """Prompt for a choice from a fixed list. Empty input → default."""
+    while True:
+        entry = input(f"{label} [{default}]: ").strip().lower()
+        if not entry:
+            return default
+        if entry in choices:
+            return entry
+        print(f"   Please enter one of: {', '.join(choices)}")

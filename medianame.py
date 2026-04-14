@@ -1,21 +1,26 @@
 """
-Create Plex-compatible folders from IMDb links / TMDB.
+Create Plex- or Jellyfin-compatible folders from IMDb links / TMDB.
 
 Reads a text file with IMDb URLs (or tt-IDs), queries the OMDb API for
-title and year, and creates Plex-compatible folders:
-    MovieTitle (Year) {imdb-ttXXXXXXXX}
+title and year, and creates media-server-compatible folders.
 
-TV shows are looked up via TMDB and created as:
+Plex preset:
+    MovieTitle (Year) {imdb-ttXXXXXXX}
     ShowTitle (Year) {tmdb-XXXXX}
 
+Jellyfin preset (IDs configurable):
+    MovieTitle (Year) [imdbid-ttXXXXXXX]   or [tmdbid-XXXXX]
+    ShowTitle (Year) [tmdbid-XXXXX]        or [imdbid-ttXXXXXXX]
+
 Usage:
-    plexname                        # Interactive mode (enter titles)
-    plexname <title>                # Direct search
-    plexname -n <title>             # Dry run (show only, no changes)
-    plexname -i <title>             # Interactive: dry run + confirmation
-    plexname -o /path/to/movies     # Override target path (movies + series)
-    plexname -f movies.txt          # Use a different input file
-    plexname -p                     # Prompt for titles (skip input file)
+    medianame                        # Interactive mode (enter titles)
+    medianame <title>                # Direct search
+    medianame -n <title>             # Dry run (show only, no changes)
+    medianame -i <title>             # Interactive: dry run + confirmation
+    medianame -o /path/to/movies     # Override target path (movies + series)
+    medianame -f movies.txt          # Use a different input file
+    medianame -p                     # Prompt for titles (skip input file)
+    medianame --preset jellyfin ...  # Override naming preset for this run
     # When the input file is empty, prompt mode starts automatically.
 """
 
@@ -35,6 +40,11 @@ TMDB_TOKEN = None
 MOVIE_PATH = None
 SERIES_PATH = None
 INPUT_FILE = "movies.txt"
+
+# Naming configuration (loaded from config.json; defaults = Plex)
+NAMING_PRESET = "plex"        # "plex" | "jellyfin"
+MOVIE_ID_SOURCE = "imdb"      # "imdb" | "tmdb"  (only used when preset=jellyfin)
+SERIES_ID_SOURCE = "tmdb"     # "imdb" | "tmdb"  (only used when preset=jellyfin)
 
 
 MAX_RETRIES = 3
@@ -78,6 +88,29 @@ def get_movie_data(imdb_id):
     return None
 
 
+def format_folder_name(title, year, id_type, id_value, preset="plex"):
+    """
+    Build a media-server-compatible folder name.
+
+    Args:
+        title: Title (already sanitized of invalid path chars).
+        year: 4-digit year string.
+        id_type: "imdb" or "tmdb".
+        id_value: ID string (e.g. "tt1375666" or "1396").
+        preset: "plex" (uses {}) or "jellyfin" (uses [] and -id- suffix).
+
+    Returns:
+        Folder name string, e.g.:
+            Plex:     "Inception (2010) {imdb-tt1375666}"
+            Jellyfin: "Inception (2010) [imdbid-tt1375666]"
+    """
+    if preset == "jellyfin":
+        tag = f"[{id_type}id-{id_value}]"
+    else:
+        tag = f"{{{id_type}-{id_value}}}"
+    return f"{title} ({year}) {tag}"
+
+
 def _tmdb_request(endpoint, params=None):
     """
     Make an authenticated TMDB API request.
@@ -116,7 +149,8 @@ def get_tmdb_details(tmdb_id, media_type):
 
     endpoint = f"/{'tv' if media_type == 'tv' else 'movie'}/{tmdb_id}"
     try:
-        data = _tmdb_request(endpoint, {"append_to_response": "credits"})
+        # external_ids gives us the IMDb ID for TV shows (Jellyfin needs it)
+        data = _tmdb_request(endpoint, {"append_to_response": "credits,external_ids"})
     except Exception as e:
         print(f"  ❌ TMDB error: {e}")
         return None
@@ -128,12 +162,15 @@ def get_tmdb_details(tmdb_id, media_type):
     actors = ", ".join(c["name"] for c in cast[:2]) if cast else "N/A"
 
     if media_type == "tv":
+        # For TV shows, TMDB returns the IMDb ID under external_ids
+        imdb_id = data.get("external_ids", {}).get("imdb_id", "") or ""
         result = {
             "Response": "True",
             "Title": data.get("name", ""),
             "Year": (data.get("first_air_date") or "")[:4],
             "Actors": actors,
             "Seasons": data.get("number_of_seasons"),
+            "imdbID": imdb_id,
         }
     else:
         result = {
@@ -149,6 +186,29 @@ def get_tmdb_details(tmdb_id, media_type):
 
     _tmdb_cache[cache_key] = result
     return result
+
+
+def get_tmdb_id_from_imdb(imdb_id, media_type):
+    """
+    Look up the TMDB ID for a given IMDb ID via TMDB's /find endpoint.
+
+    Args:
+        imdb_id: IMDb ID (e.g. "tt1375666").
+        media_type: "movie" or "tv".
+
+    Returns:
+        TMDB ID as string, or None if not found.
+    """
+    try:
+        data = _tmdb_request(f"/find/{imdb_id}", {"external_source": "imdb_id"})
+    except Exception as e:
+        print(f"  ❌ TMDB find error: {e}")
+        return None
+    key = "movie_results" if media_type == "movie" else "tv_results"
+    results = data.get(key, [])
+    if results:
+        return str(results[0]["id"])
+    return None
 
 
 def remove_processed_links(processed_ids, input_file):
@@ -377,10 +437,58 @@ def _prompt_for_links():
     return entries
 
 
-def process_list(dry_run=False, interactive=False, output_path=None, input_file=None, prompt_mode=False, direct_title=None):
+def _resolve_naming(media_type, preset):
+    """
+    Decide which ID type to tag a folder with, given the naming preset.
+
+    Plex: always imdb for movies, always tmdb for series.
+    Jellyfin: user-configurable per media type.
+
+    Returns:
+        "imdb" or "tmdb".
+    """
+    if preset == "plex":
+        return "imdb" if media_type == "movie" else "tmdb"
+    # Jellyfin
+    if media_type == "movie":
+        return MOVIE_ID_SOURCE
+    return SERIES_ID_SOURCE
+
+
+def _resolve_id_value(entry_id, media_type, want_id_type, data):
+    """
+    Return the ID value in the wanted format (imdb or tmdb).
+
+    `entry_id` is what we already have:
+      - movie flow: IMDb ID (e.g. tt1375666)
+      - tv flow:    TMDB ID (e.g. 1396)
+
+    `data` is the result from get_movie_data() or get_tmdb_details(),
+    which may carry the "other" ID we need.
+    """
+    if media_type == "movie":
+        # entry_id is an IMDb ID
+        if want_id_type == "imdb":
+            return entry_id
+        # Need a TMDB ID for this movie
+        tmdb_id = None
+        if data and data.get("tmdbID"):
+            tmdb_id = data["tmdbID"]
+        if not tmdb_id:
+            tmdb_id = get_tmdb_id_from_imdb(entry_id, "movie")
+        return tmdb_id
+    # TV: entry_id is a TMDB ID
+    if want_id_type == "tmdb":
+        return entry_id
+    # Need an IMDb ID for this TV show
+    return (data or {}).get("imdbID") or None
+
+
+def process_list(dry_run=False, interactive=False, output_path=None, input_file=None,
+                 prompt_mode=False, direct_title=None, preset_override=None):
     """
     Read the input file (or prompt interactively), deduplicate IDs,
-    and create Plex folders for movies and TV shows.
+    and create media-server-compatible folders for movies and TV shows.
 
     Args:
         dry_run: If True, show planned actions without creating folders.
@@ -388,12 +496,14 @@ def process_list(dry_run=False, interactive=False, output_path=None, input_file=
         output_path: Override the default target path (applies to movies and series).
         input_file: Override the default input file.
         prompt_mode: If True, skip the input file and prompt interactively.
-        direct_title: If set, search for this title directly
-                      (e.g. "plexname breaking bad").
+        direct_title: If set, search for this title directly.
+        preset_override: If set ("plex" or "jellyfin"), override the configured
+                         naming preset for this run only.
     """
     movie_path = output_path if output_path is not None else MOVIE_PATH
     series_path = output_path if output_path is not None else SERIES_PATH
     file_path = input_file if input_file is not None else INPUT_FILE
+    preset = preset_override or NAMING_PRESET
     use_from_file = True
 
     # Check target path (only in file mode without dry run / interactive)
@@ -468,11 +578,9 @@ def process_list(dry_run=False, interactive=False, output_path=None, input_file=
         # Fetch data and determine target path
         if media_type == "tv":
             data = get_tmdb_details(entry_id, "tv")
-            id_tag = f"tmdb-{entry_id}"
             target_path = series_path
         else:
             data = get_movie_data(entry_id)
-            id_tag = f"imdb-{entry_id}"
             target_path = movie_path
 
         if data and data.get("Response") == "True":
@@ -485,7 +593,16 @@ def process_list(dry_run=False, interactive=False, output_path=None, input_file=
             # Folder name: remove invalid characters (/:*?"<>|\ etc.)
             clean_title = re.sub(r'[<>:"/\\|?*]', '', title)
             clean_year = re.sub(r'[<>:"/\\|?*]', '', year) or "0000"
-            folder_name = f"{clean_title} ({clean_year}) {{{id_tag}}}"
+
+            # Decide ID tag based on preset + media type
+            want_id_type = _resolve_naming(media_type, preset)
+            id_value = _resolve_id_value(entry_id, media_type, want_id_type, data)
+            if not id_value:
+                print(f"❌ Could not resolve {want_id_type} ID for {entry_id} — skipping")
+                count_failed += 1
+                continue
+            folder_name = format_folder_name(clean_title, clean_year,
+                                             want_id_type, id_value, preset)
 
             full_path = os.path.join(target_path, folder_name)
             exists = os.path.exists(full_path)
@@ -572,18 +689,27 @@ def _show_help():
     """Display detailed help text."""
     movie_path = MOVIE_PATH or "<not configured>"
     series_path = SERIES_PATH or "<not configured>"
+    preset = NAMING_PRESET or "plex"
+    # Examples reflect the currently configured preset
+    if preset == "jellyfin":
+        movie_example = "Inception (2010) [imdbid-tt1375666]"
+        series_example = "Breaking Bad (2008) [tmdbid-1396]"
+    else:
+        movie_example = "Inception (2010) {imdb-tt1375666}"
+        series_example = "Breaking Bad (2008) {tmdb-1396}"
     lines = [
-        "🎬 plexname — Create Plex-compatible folders from IMDb/TMDB",
+        "🎬 medianame — Create Plex/Jellyfin-compatible folders from IMDb/TMDB",
         "",
         "Usage:",
-        "  plexname                      Interactive mode (enter titles)",
-        "  plexname <title>              Direct search (e.g. plexname breaking bad)",
-        "  plexname -n <title>           Dry run: show what would be created",
-        "  plexname -i <title>           Interactive: show first, then confirm",
-        "  plexname -f movies.txt        Process IMDb URLs from file",
-        "  plexname -o /path <title>     Override target path (movies + series)",
-        "  plexname setup                (Re)configure API keys and paths",
-        "  plexname help                 Show this help",
+        "  medianame                      Interactive mode (enter titles)",
+        "  medianame <title>              Direct search (e.g. medianame breaking bad)",
+        "  medianame -n <title>           Dry run: show what would be created",
+        "  medianame -i <title>           Interactive: show first, then confirm",
+        "  medianame -f movies.txt        Process IMDb URLs from file",
+        "  medianame -o /path <title>     Override target path (movies + series)",
+        "  medianame --preset jellyfin .. Override naming preset for this run",
+        "  medianame setup                (Re)configure API keys, paths, preset",
+        "  medianame help                 Show this help",
         "",
         "Input formats:",
         "  breaking bad                  Title search (movies + TV via TMDB)",
@@ -591,9 +717,11 @@ def _show_help():
         "  tt1375666                     IMDb ID → movie",
         "  https://themoviedb.org/tv/... TMDB URL → TV show",
         "",
+        f"Active preset: {preset}",
+        "",
         "Folder format:",
-        f"  Movies:  Inception (2010) {{imdb-tt1375666}}      → {movie_path}",
-        f"  Series:  Breaking Bad (2008) {{tmdb-1396}}         → {series_path}",
+        f"  Movies:  {movie_example}      → {movie_path}",
+        f"  Series:  {series_example}         → {series_path}",
         "           └── Season 01, Season 02, ...",
     ]
     print("\n".join(lines))
@@ -602,25 +730,31 @@ def _show_help():
 def _load_config():
     """Load configuration and set module globals."""
     global API_KEY, TMDB_TOKEN, MOVIE_PATH, SERIES_PATH
+    global NAMING_PRESET, MOVIE_ID_SOURCE, SERIES_ID_SOURCE
     import config
     cfg = config.get_config()
     API_KEY = cfg["omdb_api_key"]
     TMDB_TOKEN = cfg["tmdb_token"]
     MOVIE_PATH = cfg["movie_path"]
     SERIES_PATH = cfg["series_path"]
+    # Naming fields are optional for backwards compatibility with v1.0 configs
+    NAMING_PRESET = cfg.get("naming_preset", "plex")
+    MOVIE_ID_SOURCE = cfg.get("movie_id_source", "imdb")
+    SERIES_ID_SOURCE = cfg.get("series_id_source", "tmdb")
 
 
 def main():
     parser = argparse.ArgumentParser(
-        prog="plexname",
-        description="Create Plex-compatible folders from IMDb/TMDB",
+        prog="medianame",
+        description="Create Plex/Jellyfin-compatible folders from IMDb/TMDB",
     )
     parser.add_argument("title", nargs="*", help="Movie or TV show title (starts direct search)")
     parser.add_argument("-n", "--dry-run", action="store_true", help="Show what would be created (no changes)")
     parser.add_argument("-i", "--interactive", action="store_true", help="Dry run, then confirm: create folders? (y/n)")
-    parser.add_argument("-o", "--output", metavar="PATH", help="Override target path for Plex folders")
+    parser.add_argument("-o", "--output", metavar="PATH", help="Override target path for folders")
     parser.add_argument("-f", "--file", metavar="FILE", dest="input_file", help="Alternative input file (default: movies.txt)")
     parser.add_argument("-p", "--prompt", action="store_true", help="Prompt for movies/series (skip input file)")
+    parser.add_argument("--preset", choices=["plex", "jellyfin"], help="Override naming preset for this run")
     args = parser.parse_args()
 
     # Handle setup and help before loading config
@@ -634,9 +768,10 @@ def main():
         import config
         cfg = config.load_config()
         if cfg:
-            global MOVIE_PATH, SERIES_PATH
+            global MOVIE_PATH, SERIES_PATH, NAMING_PRESET
             MOVIE_PATH = cfg["movie_path"]
             SERIES_PATH = cfg["series_path"]
+            NAMING_PRESET = cfg.get("naming_preset", "plex")
         _show_help()
         return
 
@@ -644,19 +779,21 @@ def main():
     _load_config()
 
     if args.title:
-        # Direct search: "plexname breaking bad" → join title words
+        # Direct search: "medianame breaking bad" → join title words
         title = " ".join(args.title)
         process_list(dry_run=args.dry_run, interactive=args.interactive,
                      output_path=args.output, input_file=args.input_file,
-                     prompt_mode=True, direct_title=title)
+                     prompt_mode=True, direct_title=title, preset_override=args.preset)
     elif args.input_file:
         # File mode: only when -f is explicitly given
         process_list(dry_run=args.dry_run, interactive=args.interactive,
-                     output_path=args.output, input_file=args.input_file)
+                     output_path=args.output, input_file=args.input_file,
+                     preset_override=args.preset)
     else:
         # No arguments or -p → interactive prompt
         process_list(dry_run=args.dry_run, interactive=args.interactive,
-                     output_path=args.output, prompt_mode=True)
+                     output_path=args.output, prompt_mode=True,
+                     preset_override=args.preset)
 
 
 if __name__ == "__main__":

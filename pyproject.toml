@@ -3,15 +3,15 @@ requires = ["setuptools>=64"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "plexname"
-version = "1.0.0"
-description = "Create Plex-compatible folders from IMDb/TMDB"
+name = "medianame"
+version = "1.1.0"
+description = "Create Plex- or Jellyfin-compatible folders from IMDb/TMDB"
 readme = "README.md"
 requires-python = ">=3.9"
 license = "MIT"
 license-files = ["LICENSE"]
 authors = [{name = "Pascal Koch"}]
-keywords = ["plex", "imdb", "tmdb", "media", "cli"]
+keywords = ["plex", "jellyfin", "imdb", "tmdb", "media", "cli"]
 classifiers = [
     "Development Status :: 5 - Production/Stable",
     "Environment :: Console",
@@ -27,12 +27,12 @@ classifiers = [
 dependencies = ["requests"]
 
 [project.urls]
-Homepage = "https://github.com/psclkoch/plexname"
-Repository = "https://github.com/psclkoch/plexname"
-Issues = "https://github.com/psclkoch/plexname/issues"
+Homepage = "https://github.com/psclkoch/medianame"
+Repository = "https://github.com/psclkoch/medianame"
+Issues = "https://github.com/psclkoch/medianame/issues"
 
 [tool.setuptools]
-py-modules = ["movie_fix", "config"]
+py-modules = ["medianame", "config"]
 
 [project.scripts]
-plexname = "movie_fix:main"
+medianame = "medianame:main"
