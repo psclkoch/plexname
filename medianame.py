@@ -27,6 +27,10 @@ Usage:
                                      # cleaned up automatically.
     medianame scan --copy <path>     # Scan and copy instead of move
     medianame scan --max-age-days N  # Restrict scan to entries from the last N days
+    medianame scan --no-publish      # Skip the publish step for this run
+    medianame publish [<path>]       # Move tag-named folders from the working
+                                     # paths into the configured Plex/Jellyfin
+                                     # library (setup steps 12/13).
     medianame setup                  # (Re)configure API keys, paths, preset
     # When the input file is empty, prompt mode starts automatically.
 """
@@ -1109,10 +1113,12 @@ def execute_scan_plan(plan, operation="move"):
         operation: "move" or "copy".
 
     Returns:
-        dict with counts: moved, copied, skipped, failed.
+        dict with counts: moved, copied, skipped, failed, cleaned,
+        and a set "created_folders" with target paths that ended up
+        populated (used for the optional publish step).
     """
     counts = {"moved": 0, "copied": 0, "skipped": 0, "failed": 0,
-              "cleaned": 0}
+              "cleaned": 0, "created_folders": set()}
     op_fn = shutil.move if operation == "move" else shutil.copy2
     verb_past = "Moved" if operation == "move" else "Copied"
     counter_key = "moved" if operation == "move" else "copied"
@@ -1152,6 +1158,7 @@ def execute_scan_plan(plan, operation="move"):
                 op_fn(src, dest)
                 print(f"  ✅ {verb_past}: {os.path.basename(src)}")
                 counts[counter_key] += 1
+                counts["created_folders"].add(entry["target_path"])
             except OSError as e:
                 print(f"  ❌ Failed {os.path.basename(src)}: {e}")
                 counts["failed"] += 1
@@ -1222,7 +1229,7 @@ def _print_scan_plan(plan, operation):
 
 
 def process_scan(source_path=None, operation=None, preset_override=None,
-                 max_age_days=0):
+                 max_age_days=0, publish_mode="auto"):
     """
     High-level entry point for `medianame scan`.
 
@@ -1232,6 +1239,9 @@ def process_scan(source_path=None, operation=None, preset_override=None,
         preset_override: Naming preset override for this run.
         max_age_days: If > 0, only consider top-level entries modified
                       within the last N days.
+        publish_mode: "auto" (default — publish when library paths are
+                      configured), "force" (always attempt publish),
+                      or "off" (never publish).
     """
     if source_path is None:
         source_path = _choose_scan_source()
@@ -1296,6 +1306,905 @@ def process_scan(source_path=None, operation=None, preset_override=None,
     if parts:
         print(f"\n📊 Summary: {', '.join(parts)}")
 
+    # Optional publish step: move the freshly created library folders into
+    # the configured Plex/Jellyfin library paths.
+    if publish_mode == "off":
+        return
+    created = counts.get("created_folders") or set()
+    if publish_mode == "auto":
+        if not (MOVIE_LIBRARY_PATH or SERIES_LIBRARY_PATH):
+            return
+        _publish_after_scan(created, operation="move")
+    elif publish_mode == "force":
+        if not (MOVIE_LIBRARY_PATH or SERIES_LIBRARY_PATH):
+            print("ℹ️ --publish requested but no library paths configured.")
+            return
+        _publish_after_scan(created, operation="move")
+
+
+# ===========================================================================
+# Publish feature — move finished, tag-named folders from the working area
+# (MOVIE_PATH / SERIES_PATH) into the actual Plex/Jellyfin library
+# (MOVIE_LIBRARY_PATH / SERIES_LIBRARY_PATH). Optional — the target paths
+# are only configured when the user wants this step automated.
+# ===========================================================================
+
+MOVIE_LIBRARY_PATH = None
+SERIES_LIBRARY_PATH = None
+
+# Files below this size skip the progress indicator for cross-FS copies.
+_PROGRESS_MIN_BYTES = 100 * 1024 * 1024  # 100 MB
+# Block size used by the progress-aware copy.
+_COPY_BLOCK_BYTES = 4 * 1024 * 1024  # 4 MB
+
+_SEASON_DIR_RE = re.compile(r"^Season\s+(\d{1,3})$", re.IGNORECASE)
+# Matches folder names with our title/year prefix (with or without tag)
+_TITLE_YEAR_RE = re.compile(r"^(?P<base>.+?\(\d{4}\))(?:\s+[\{\[].+[\}\]])?\s*$")
+
+
+def _fmt_size(num_bytes):
+    """Human-readable file size: 123.4 MB / 4.5 GB."""
+    if num_bytes is None:
+        return "?"
+    n = float(num_bytes)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024 or unit == "TB":
+            return f"{n:.1f} {unit}" if unit != "B" else f"{int(n)} B"
+        n /= 1024
+    return f"{num_bytes} B"
+
+
+def _fmt_mtime(ts):
+    """Format an mtime timestamp as YYYY-MM-DD."""
+    if ts is None:
+        return "?"
+    try:
+        return time.strftime("%Y-%m-%d", time.localtime(ts))
+    except (ValueError, OSError):
+        return "?"
+
+
+def _file_fingerprint(path):
+    """Return (size, mtime) or (None, None) if the file is gone."""
+    try:
+        st = os.stat(path)
+        return st.st_size, st.st_mtime
+    except OSError:
+        return None, None
+
+
+def _list_video_files(folder):
+    """
+    Return a list of (path, size, mtime) for video files in `folder`
+    (non-recursive). Used for conflict display.
+    """
+    out = []
+    try:
+        for name in sorted(os.listdir(folder)):
+            ext = os.path.splitext(name)[1].lower()
+            if ext not in VIDEO_EXTENSIONS:
+                continue
+            full = os.path.join(folder, name)
+            size, mtime = _file_fingerprint(full)
+            out.append((full, size, mtime))
+    except OSError:
+        return []
+    return out
+
+
+def _copy_with_progress(src, dst):
+    """
+    Copy `src` to `dst` with a one-line progress indicator for files
+    >= _PROGRESS_MIN_BYTES. Preserves metadata via shutil.copystat after
+    the byte copy. For smaller files, falls back to shutil.copy2.
+    """
+    try:
+        size = os.path.getsize(src)
+    except OSError:
+        size = 0
+    if size < _PROGRESS_MIN_BYTES:
+        shutil.copy2(src, dst)
+        return
+    label = os.path.basename(src)
+    done = 0
+    last_pct = -1
+    with open(src, "rb") as fin, open(dst, "wb") as fout:
+        while True:
+            chunk = fin.read(_COPY_BLOCK_BYTES)
+            if not chunk:
+                break
+            fout.write(chunk)
+            done += len(chunk)
+            pct = int(done * 100 / size)
+            if pct != last_pct:
+                last_pct = pct
+                print(f"\r      Copying {label} … "
+                      f"{_fmt_size(done)} / {_fmt_size(size)} ({pct}%)",
+                      end="", flush=True)
+    shutil.copystat(src, dst, follow_symlinks=False)
+    print()
+
+
+def _move_or_copy_file(src, dst, operation="move"):
+    """
+    Move or copy a single file, using progress-aware copy for large files
+    on cross-filesystem moves. Returns True on success, False on error.
+    """
+    try:
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        if operation == "copy":
+            _copy_with_progress(src, dst)
+            return True
+        # move: try os.rename (same FS, instant); fall back to copy+delete
+        try:
+            os.rename(src, dst)
+            return True
+        except OSError:
+            _copy_with_progress(src, dst)
+            os.remove(src)
+            return True
+    except OSError as e:
+        print(f"      ❌ {e}")
+        return False
+
+
+def _move_folder(src, dst):
+    """
+    Move a whole folder to `dst`. If dst already exists, fail — callers
+    should handle merges explicitly.
+    """
+    if os.path.exists(dst):
+        raise OSError(f"Destination already exists: {dst}")
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    try:
+        os.rename(src, dst)
+        return
+    except OSError:
+        pass
+    # Cross-FS: walk + copy + remove
+    for root, dirs, files in os.walk(src):
+        rel = os.path.relpath(root, src)
+        target_root = os.path.join(dst, rel) if rel != "." else dst
+        os.makedirs(target_root, exist_ok=True)
+        for f in files:
+            s = os.path.join(root, f)
+            d = os.path.join(target_root, f)
+            _copy_with_progress(s, d)
+    shutil.rmtree(src)
+
+
+def _find_library_match(library_root, folder_name):
+    """
+    Look for a folder in `library_root` that matches `folder_name` either
+    exactly or by title+year prefix (ignoring the ID tag).
+
+    Returns:
+        ("exact", existing_name) — exact-name match, merge path
+        ("rename", existing_name) — same title+year, different tag/no tag
+        (None, None) — nothing matching
+    """
+    if not library_root or not os.path.isdir(library_root):
+        return (None, None)
+    try:
+        entries = os.listdir(library_root)
+    except OSError:
+        return (None, None)
+    if folder_name in entries:
+        return ("exact", folder_name)
+    m = _TITLE_YEAR_RE.match(folder_name)
+    base = m.group("base") if m else None
+    if not base:
+        return (None, None)
+    for existing in entries:
+        em = _TITLE_YEAR_RE.match(existing)
+        if em and em.group("base") == base and existing != folder_name:
+            return ("rename", existing)
+    return (None, None)
+
+
+def _scan_for_publishable_items(staging_root):
+    """
+    Return a list of {"name", "source", "media_type"} for every tag-named
+    folder directly under `staging_root`. `media_type` is "tv" if the folder
+    contains a `Season NN/` subdir, otherwise "movie".
+    """
+    items = []
+    if not os.path.isdir(staging_root):
+        return items
+    for entry in sorted(os.listdir(staging_root)):
+        full = os.path.join(staging_root, entry)
+        if not os.path.isdir(full):
+            continue
+        if not _is_library_folder(entry):
+            continue
+        media_type = "movie"
+        try:
+            for sub in os.listdir(full):
+                if os.path.isdir(os.path.join(full, sub)) and _SEASON_DIR_RE.match(sub):
+                    media_type = "tv"
+                    break
+        except OSError:
+            continue
+        items.append({"name": entry, "source": full, "media_type": media_type})
+    return items
+
+
+def build_publish_plan(staging_roots):
+    """
+    Build a publish plan from one or more staging roots.
+
+    `staging_roots` is a list of (staging_path, library_path, media_type)
+    tuples. Media type is used as a fallback when the folder content is
+    ambiguous (e.g. a show without season folders yet).
+
+    Returns a list of plan dicts:
+        {
+            "source": staging_path_to_folder,
+            "folder_name": original_tag_name,
+            "media_type": "movie" | "tv",
+            "library_root": target_library_root,
+            "match": "new" | "exact" | "rename",
+            "existing_name": str | None,  # when match != "new"
+        }
+    """
+    plan = []
+    for staging, library, default_type in staging_roots:
+        if not staging or not library:
+            continue
+        for item in _scan_for_publishable_items(staging):
+            media_type = item["media_type"] or default_type
+            kind, existing = _find_library_match(library, item["name"])
+            plan.append({
+                "source": item["source"],
+                "folder_name": item["name"],
+                "media_type": media_type,
+                "library_root": library,
+                "match": kind or "new",
+                "existing_name": existing,
+            })
+    return plan
+
+
+def _print_publish_plan(plan):
+    """Render the publish plan for the confirmation prompt."""
+    divider = "=" * 60
+    print()
+    print(divider)
+    print(f"Publish plan — {len(plan)} item(s):")
+    print(divider)
+    for idx, entry in enumerate(plan, 1):
+        print()
+        type_label = "TV Show" if entry["media_type"] == "tv" else "Movie"
+        print(f"[{idx}] {entry['folder_name']} ({type_label})")
+        print(f"    From:   {entry['source']}")
+        dest = os.path.join(entry["library_root"], entry["folder_name"])
+        if entry["match"] == "new":
+            print(f"    To:     {dest}")
+            print(f"    Status: New — move as-is")
+        elif entry["match"] == "exact":
+            print(f"    To:     {dest}")
+            print(f"    Status: Merge into existing folder (conflicts")
+            print(f"            resolved per file during execution)")
+        elif entry["match"] == "rename":
+            existing_path = os.path.join(entry["library_root"], entry["existing_name"])
+            print(f"    To:     {dest}")
+            print(f"    ⚠️ Similar folder found in library:")
+            print(f"       {existing_path}")
+            print(f"    Status: Prompt at execution time — rename + merge")
+    print()
+    print(divider)
+
+
+# --- Conflict resolution -----------------------------------------------------
+
+def _prompt_file_conflict(src, dst):
+    """
+    Ask the user what to do when a file with the same name already exists
+    in the target. Shows size + mtime for both.
+
+    Returns: "replace", "skip", "keep_both", "abort".
+    """
+    s_size, s_mtime = _file_fingerprint(src)
+    d_size, d_mtime = _file_fingerprint(dst)
+    print(f"    ⚠️ File exists: {os.path.basename(dst)}")
+    print(f"       Existing: {_fmt_size(d_size)}, modified {_fmt_mtime(d_mtime)}")
+    print(f"       New:      {_fmt_size(s_size)}, modified {_fmt_mtime(s_mtime)}")
+    while True:
+        try:
+            answer = input("       [r]eplace / [s]kip / [b]oth / [a]bort: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return "abort"
+        if answer in ("r", "replace"):
+            return "replace"
+        if answer in ("s", "skip"):
+            return "skip"
+        if answer in ("b", "both", "k"):
+            return "keep_both"
+        if answer in ("a", "abort"):
+            return "abort"
+
+
+def _prompt_foreign_file(src, existing_videos):
+    """
+    Ask the user what to do when the new file is a video with a *different*
+    name from existing videos in the target (user policy: one movie per
+    folder, so still ask).
+
+    Returns: "replace_all", "skip", "keep_both", "abort".
+    """
+    s_size, s_mtime = _file_fingerprint(src)
+    print(f"    ⚠️ Target already contains video(s):")
+    for p, size, mtime in existing_videos:
+        print(f"       • {os.path.basename(p)} "
+              f"({_fmt_size(size)}, {_fmt_mtime(mtime)})")
+    print(f"       New file: {os.path.basename(src)} "
+          f"({_fmt_size(s_size)}, {_fmt_mtime(s_mtime)})")
+    while True:
+        try:
+            answer = input("       [r]eplace existing / [s]kip new / "
+                           "[b]oth / [a]bort: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return "abort"
+        if answer in ("r", "replace"):
+            return "replace_all"
+        if answer in ("s", "skip"):
+            return "skip"
+        if answer in ("b", "both", "k"):
+            return "keep_both"
+        if answer in ("a", "abort"):
+            return "abort"
+
+
+def _prompt_rename_merge(source_folder, existing_folder, new_name):
+    """
+    When the library has a similarly-named folder without the right tag.
+    Offer the 4 options the user specified.
+
+    Returns: "keep_old", "keep_new", "keep_all", "skip", "abort".
+    """
+    existing_videos = _list_video_files(existing_folder)
+    source_videos = _list_video_files(source_folder)
+    print()
+    print(f"    ⚠️ Similar library folder found:")
+    print(f"       Existing: {os.path.basename(existing_folder)}")
+    for p, size, mtime in existing_videos:
+        print(f"          • {os.path.basename(p)} "
+              f"({_fmt_size(size)}, {_fmt_mtime(mtime)})")
+    if not existing_videos:
+        print(f"          (no top-level videos)")
+    print(f"       New:      {new_name}")
+    for p, size, mtime in source_videos:
+        print(f"          • {os.path.basename(p)} "
+              f"({_fmt_size(size)}, {_fmt_mtime(mtime)})")
+    if not source_videos:
+        print(f"          (no top-level videos)")
+    print()
+    print("       [1] Rename to new, keep old files (discard new)")
+    print("       [2] Rename to new, replace with new files (discard old)")
+    print("       [3] Rename to new, keep all files")
+    print("       [4] Skip (leave both as-is)")
+    while True:
+        try:
+            answer = input("       Choice: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return "abort"
+        if answer == "1":
+            return "keep_old"
+        if answer == "2":
+            return "keep_new"
+        if answer == "3":
+            return "keep_all"
+        if answer == "4":
+            return "skip"
+
+
+def _prompt_episode_schema_conflict(src_name, existing_names):
+    """
+    Warn when the incoming episode file uses a different naming pattern
+    than the episodes already in the season folder.
+
+    Returns: "keep_as_is", "skip", "abort".
+    """
+    print(f"    ⚠️ Naming scheme differs from existing episodes:")
+    print(f"       New:      {src_name}")
+    print(f"       Existing examples:")
+    for n in existing_names[:3]:
+        print(f"          • {n}")
+    while True:
+        try:
+            answer = input("       [k]eep new name / [s]kip / [a]bort: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return "abort"
+        if answer in ("k", "keep", ""):
+            return "keep_as_is"
+        if answer in ("s", "skip"):
+            return "skip"
+        if answer in ("a", "abort"):
+            return "abort"
+
+
+def _episode_schema_signature(name):
+    """
+    Crude signature of an episode filename's naming scheme.
+    Replaces digits with "#" and strips the extension, so
+    "Show - S01E02 - Title.mkv" → "Show - S##E## - Title"
+    """
+    base = os.path.splitext(name)[0]
+    return re.sub(r"\d", "#", base)
+
+
+# --- Plan execution ----------------------------------------------------------
+
+def _merge_files(src_dir, dst_dir, operation, cleanup_tracker):
+    """
+    Merge the contents of src_dir into dst_dir file by file.
+
+    For each file:
+      - identical fingerprint (name + size) → skip silently
+      - videos, different name than existing videos → _prompt_foreign_file
+      - same name, different fingerprint → _prompt_file_conflict
+      - new name → just move/copy
+
+    Returns "ok", "skip" (some files skipped, source not empty), or "abort".
+    """
+    try:
+        os.makedirs(dst_dir, exist_ok=True)
+    except OSError as e:
+        print(f"    ❌ Cannot create {dst_dir}: {e}")
+        return "abort"
+
+    had_conflict_skip = False
+
+    try:
+        entries = sorted(os.listdir(src_dir))
+    except OSError as e:
+        print(f"    ❌ Cannot read {src_dir}: {e}")
+        return "abort"
+
+    for name in entries:
+        src = os.path.join(src_dir, name)
+        if os.path.isdir(src):
+            # Nested dirs (Season NN/, subs/, …) → recurse
+            result = _merge_files(src, os.path.join(dst_dir, name),
+                                  operation, cleanup_tracker)
+            if result == "abort":
+                return "abort"
+            if result == "skip":
+                had_conflict_skip = True
+            continue
+        dst = os.path.join(dst_dir, name)
+        s_size, _ = _file_fingerprint(src)
+
+        # Check: same filename already exists?
+        if os.path.exists(dst):
+            d_size, _ = _file_fingerprint(dst)
+            if s_size == d_size:
+                # Identical → skip silently, remove src on move
+                print(f"    ⏭  Identical, skipped: {name}")
+                if operation == "move":
+                    try:
+                        os.remove(src)
+                        cleanup_tracker["removed"] += 1
+                    except OSError:
+                        pass
+                continue
+            decision = _prompt_file_conflict(src, dst)
+            if decision == "abort":
+                return "abort"
+            if decision == "skip":
+                had_conflict_skip = True
+                continue
+            if decision == "replace":
+                try:
+                    os.remove(dst)
+                except OSError as e:
+                    print(f"    ❌ Cannot overwrite {dst}: {e}")
+                    had_conflict_skip = True
+                    continue
+                ok = _move_or_copy_file(src, dst, operation)
+                if not ok:
+                    had_conflict_skip = True
+                    continue
+                print(f"    ✅ Replaced: {name}")
+                continue
+            if decision == "keep_both":
+                new_dst = _unique_path(dst)
+                ok = _move_or_copy_file(src, new_dst, operation)
+                if not ok:
+                    had_conflict_skip = True
+                    continue
+                print(f"    ✅ Kept both: {os.path.basename(new_dst)}")
+                continue
+
+        # No same-name conflict. If it's a video, check for foreign videos.
+        # Skip this check inside Season NN/ folders, where multiple distinct
+        # episode filenames are expected.
+        ext = os.path.splitext(name)[1].lower()
+        in_season = bool(_SEASON_DIR_RE.match(os.path.basename(dst_dir)))
+        if ext in VIDEO_EXTENSIONS and not in_season:
+            existing_videos = _list_video_files(dst_dir)
+            if existing_videos:
+                decision = _prompt_foreign_file(src, existing_videos)
+                if decision == "abort":
+                    return "abort"
+                if decision == "skip":
+                    had_conflict_skip = True
+                    continue
+                if decision == "replace_all":
+                    for p, _, _ in existing_videos:
+                        try:
+                            os.remove(p)
+                        except OSError as e:
+                            print(f"    ⚠️ Could not remove {p}: {e}")
+                    ok = _move_or_copy_file(src, dst, operation)
+                    if not ok:
+                        had_conflict_skip = True
+                        continue
+                    print(f"    ✅ Replaced library video(s) with: {name}")
+                    continue
+                # keep_both = fallthrough to normal move
+
+        # Episode schema check (only inside Season NN folders)
+        if (ext in VIDEO_EXTENSIONS
+                and _SEASON_DIR_RE.match(os.path.basename(dst_dir))):
+            existing_eps = [n for n in os.listdir(dst_dir)
+                            if os.path.splitext(n)[1].lower() in VIDEO_EXTENSIONS
+                            and os.path.isfile(os.path.join(dst_dir, n))]
+            if existing_eps:
+                sig_new = _episode_schema_signature(name)
+                sigs_existing = {_episode_schema_signature(n) for n in existing_eps}
+                if sig_new not in sigs_existing:
+                    decision = _prompt_episode_schema_conflict(name, existing_eps)
+                    if decision == "abort":
+                        return "abort"
+                    if decision == "skip":
+                        had_conflict_skip = True
+                        continue
+                    # keep_as_is → fall through
+
+        ok = _move_or_copy_file(src, dst, operation)
+        if not ok:
+            had_conflict_skip = True
+            continue
+        print(f"    ✅ {os.path.basename(dst)}")
+
+    return "skip" if had_conflict_skip else "ok"
+
+
+def _unique_path(path):
+    """
+    Return a path that doesn't exist yet by appending ' (1)', ' (2)', … to
+    the filename stem. Used for the keep-both case.
+    """
+    if not os.path.exists(path):
+        return path
+    stem, ext = os.path.splitext(path)
+    for i in range(1, 1000):
+        candidate = f"{stem} ({i}){ext}"
+        if not os.path.exists(candidate):
+            return candidate
+    return f"{stem} (dup){ext}"
+
+
+def _cleanup_staging(folder):
+    """
+    Remove `folder` if empty. If not empty, print a summary of what's left
+    and ask whether to delete anyway.
+    """
+    if not os.path.isdir(folder):
+        return
+    remaining = []
+    for root, _dirs, files in os.walk(folder):
+        for f in files:
+            full = os.path.join(root, f)
+            try:
+                size = os.path.getsize(full)
+            except OSError:
+                size = 0
+            remaining.append((os.path.relpath(full, folder), size))
+    if not remaining:
+        try:
+            shutil.rmtree(folder)
+            print(f"  🧹 Removed empty staging folder: {os.path.basename(folder)}")
+        except OSError as e:
+            print(f"  ⚠️ Could not remove staging folder: {e}")
+        return
+    print(f"  ℹ️ Staging folder not empty — {len(remaining)} file(s) remaining:")
+    for rel, size in remaining[:10]:
+        print(f"     • {rel} ({_fmt_size(size)})")
+    if len(remaining) > 10:
+        print(f"     … and {len(remaining) - 10} more")
+    try:
+        answer = input("     Delete staging folder anyway? "
+                       "[Enter = yes, n = keep]: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        answer = "n"
+    if answer in ("", "y", "yes", "j", "ja"):
+        try:
+            shutil.rmtree(folder)
+            print(f"  🧹 Removed: {os.path.basename(folder)}")
+        except OSError as e:
+            print(f"  ⚠️ Could not remove: {e}")
+    else:
+        print(f"  ℹ️ Kept: {folder}")
+
+
+def execute_publish_plan(plan, operation="move"):
+    """
+    Execute a publish plan. Returns a counts dict.
+    """
+    counts = {"moved": 0, "merged": 0, "renamed": 0,
+              "skipped": 0, "conflicts": 0}
+    for entry in plan:
+        src = entry["source"]
+        name = entry["folder_name"]
+        library = entry["library_root"]
+        match = entry["match"]
+        dst = os.path.join(library, name)
+        print(f"\n📤 {name}")
+
+        if match == "new":
+            # Simple case: just move/rename the whole folder.
+            try:
+                _move_folder(src, dst)
+                print(f"  ✅ Published: {dst}")
+                counts["moved"] += 1
+            except OSError as e:
+                print(f"  ❌ Failed: {e}")
+                counts["skipped"] += 1
+            continue
+
+        if match == "rename":
+            existing_folder = os.path.join(library, entry["existing_name"])
+            decision = _prompt_rename_merge(src, existing_folder, name)
+            if decision == "abort":
+                print("  ⛔ Aborted by user.")
+                return counts
+            if decision == "skip":
+                print(f"  ⏭  Skipped: {name}")
+                counts["skipped"] += 1
+                continue
+            if decision == "keep_old":
+                # Rename existing folder, discard new files
+                try:
+                    os.rename(existing_folder, dst)
+                    shutil.rmtree(src)
+                    print(f"  ✅ Renamed existing → {name}, discarded new files")
+                    counts["renamed"] += 1
+                except OSError as e:
+                    print(f"  ❌ Failed: {e}")
+                    counts["skipped"] += 1
+                continue
+            if decision == "keep_new":
+                # Remove existing, move new in with new name
+                try:
+                    shutil.rmtree(existing_folder)
+                    _move_folder(src, dst)
+                    print(f"  ✅ Replaced existing with new content ({name})")
+                    counts["renamed"] += 1
+                except OSError as e:
+                    print(f"  ❌ Failed: {e}")
+                    counts["skipped"] += 1
+                continue
+            if decision == "keep_all":
+                # Rename existing, then merge new files in
+                try:
+                    os.rename(existing_folder, dst)
+                except OSError as e:
+                    print(f"  ❌ Rename failed: {e}")
+                    counts["skipped"] += 1
+                    continue
+                cleanup_tracker = {"removed": 0}
+                result = _merge_files(src, dst, operation, cleanup_tracker)
+                if result == "abort":
+                    print("  ⛔ Aborted by user.")
+                    return counts
+                counts["renamed"] += 1
+                if result == "skip":
+                    counts["conflicts"] += 1
+                if operation == "move":
+                    _cleanup_staging(src)
+                continue
+
+        if match == "exact":
+            cleanup_tracker = {"removed": 0}
+            result = _merge_files(src, dst, operation, cleanup_tracker)
+            if result == "abort":
+                print("  ⛔ Aborted by user.")
+                return counts
+            counts["merged"] += 1
+            if result == "skip":
+                counts["conflicts"] += 1
+            if operation == "move":
+                _cleanup_staging(src)
+
+    return counts
+
+
+def process_publish(source_path=None, operation="move"):
+    """
+    High-level entry point for `medianame publish`.
+
+    If `source_path` is given, treat it as a staging root and infer media
+    type (movie vs. series) from which library path best matches. If it
+    matches neither, fall back to both library paths by folder content.
+    Without `source_path`, publish both configured staging roots (MOVIE_PATH,
+    SERIES_PATH) into their matching libraries.
+    """
+    if not MOVIE_LIBRARY_PATH and not SERIES_LIBRARY_PATH:
+        print("❌ Publish is not configured.")
+        print("   Run `medianame setup` and fill in steps 12 and/or 13.")
+        return
+
+    staging_roots = []
+    if source_path:
+        # Map the given staging to whichever library fits.
+        # If the staging is one of the configured ones, pair accordingly;
+        # otherwise, try both.
+        if source_path == MOVIE_PATH and MOVIE_LIBRARY_PATH:
+            staging_roots.append((source_path, MOVIE_LIBRARY_PATH, "movie"))
+        elif source_path == SERIES_PATH and SERIES_LIBRARY_PATH:
+            staging_roots.append((source_path, SERIES_LIBRARY_PATH, "tv"))
+        else:
+            # Ambiguous: build a per-item plan using both libraries.
+            # We'll let each item's content-based media_type pick the lib.
+            if MOVIE_LIBRARY_PATH:
+                staging_roots.append((source_path, MOVIE_LIBRARY_PATH, "movie"))
+            if SERIES_LIBRARY_PATH:
+                staging_roots.append((source_path, SERIES_LIBRARY_PATH, "tv"))
+    else:
+        if MOVIE_PATH and MOVIE_LIBRARY_PATH:
+            staging_roots.append((MOVIE_PATH, MOVIE_LIBRARY_PATH, "movie"))
+        if SERIES_PATH and SERIES_LIBRARY_PATH:
+            staging_roots.append((SERIES_PATH, SERIES_LIBRARY_PATH, "tv"))
+
+    if not staging_roots:
+        print("❌ No staging root / library pair is configured.")
+        return
+
+    raw_plan = build_publish_plan(staging_roots)
+    # When the same staging folder is paired with both libraries (custom
+    # source path), deduplicate: keep the entry whose declared media_type
+    # matches the folder's content-inferred media_type.
+    plan = _dedupe_publish_plan(raw_plan)
+
+    if not plan:
+        print("Nothing to publish (no tagged folders found).")
+        return
+
+    _print_publish_plan(plan)
+    try:
+        answer = input(f"\nProceed: publish {len(plan)} item(s)? "
+                       f"[Enter = yes, n = cancel]: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        answer = "n"
+    if answer not in ("", "y", "yes", "j", "ja"):
+        print("Cancelled.")
+        return
+
+    counts = execute_publish_plan(plan, operation=operation)
+    parts = []
+    if counts["moved"]:
+        parts.append(f"{counts['moved']} published")
+    if counts["merged"]:
+        parts.append(f"{counts['merged']} merged")
+    if counts["renamed"]:
+        parts.append(f"{counts['renamed']} renamed")
+    if counts["conflicts"]:
+        parts.append(f"{counts['conflicts']} with unresolved conflicts")
+    if counts["skipped"]:
+        parts.append(f"{counts['skipped']} skipped")
+    if parts:
+        print(f"\n📊 Publish summary: {', '.join(parts)}")
+
+
+def _dedupe_publish_plan(plan):
+    """
+    When the same source folder was paired with multiple libraries (custom
+    path), keep the entry whose declared media_type matches the folder's
+    content. If no match found, keep the first.
+    """
+    by_source = {}
+    for entry in plan:
+        key = entry["source"]
+        if key not in by_source:
+            by_source[key] = entry
+            continue
+        # Two entries for the same source — pick the one whose library
+        # expects the same media type as the folder content suggests.
+        # The folder's content-based type lives on each plan entry from
+        # _scan_for_publishable_items via build_publish_plan: here both
+        # entries share the same content-inferred media_type, so pick the
+        # library whose default media type matches.
+        existing = by_source[key]
+        # Prefer the entry where media_type matches the item (which is
+        # actually the *same* because scan picks it from content); if tied,
+        # keep the first.
+        if entry["media_type"] == existing["media_type"]:
+            continue
+        by_source[key] = entry
+    return list(by_source.values())
+
+
+def _publish_after_scan(created_folders, operation="move"):
+    """
+    After a successful scan, publish any tag-named folders we just created.
+    `created_folders` is a set of absolute paths.
+    """
+    if not created_folders:
+        return
+    if not MOVIE_LIBRARY_PATH and not SERIES_LIBRARY_PATH:
+        return
+    # Only publish folders that match a configured library + still exist.
+    plan_items = []
+    for folder in sorted(created_folders):
+        if not os.path.isdir(folder):
+            continue
+        parent = os.path.dirname(folder)
+        name = os.path.basename(folder)
+        if not _is_library_folder(name):
+            continue
+        # Pair parent (staging root) with the matching library
+        if parent == MOVIE_PATH and MOVIE_LIBRARY_PATH:
+            lib, default_type = MOVIE_LIBRARY_PATH, "movie"
+        elif parent == SERIES_PATH and SERIES_LIBRARY_PATH:
+            lib, default_type = SERIES_LIBRARY_PATH, "tv"
+        else:
+            continue
+        media_type = "movie"
+        try:
+            for sub in os.listdir(folder):
+                if (os.path.isdir(os.path.join(folder, sub))
+                        and _SEASON_DIR_RE.match(sub)):
+                    media_type = "tv"
+                    break
+        except OSError:
+            continue
+        kind, existing = _find_library_match(lib, name)
+        plan_items.append({
+            "source": folder,
+            "folder_name": name,
+            "media_type": media_type or default_type,
+            "library_root": lib,
+            "match": kind or "new",
+            "existing_name": existing,
+        })
+    if not plan_items:
+        return
+
+    print()
+    print("📤 Publishing to library...")
+    _print_publish_plan(plan_items)
+    try:
+        answer = input(f"\nProceed: publish {len(plan_items)} item(s) to library? "
+                       f"[Enter = yes, n = skip publish]: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        answer = "n"
+    if answer not in ("", "y", "yes", "j", "ja"):
+        print("Publish skipped.")
+        return
+    counts = execute_publish_plan(plan_items, operation=operation)
+    parts = []
+    if counts["moved"]:
+        parts.append(f"{counts['moved']} published")
+    if counts["merged"]:
+        parts.append(f"{counts['merged']} merged")
+    if counts["renamed"]:
+        parts.append(f"{counts['renamed']} renamed")
+    if counts["conflicts"]:
+        parts.append(f"{counts['conflicts']} with conflicts")
+    if counts["skipped"]:
+        parts.append(f"{counts['skipped']} skipped")
+    if parts:
+        print(f"\n📊 Publish summary: {', '.join(parts)}")
+
 
 def _show_help():
     """Display detailed help text."""
@@ -1328,6 +2237,9 @@ def _show_help():
         "  medianame scan --copy <path>   Scan and copy (preserve source)",
         "  medianame scan --max-age-days N",
         "                                 Scan: only entries modified in the last N days",
+        "  medianame scan --no-publish    Scan: skip publish step this run",
+        "  medianame publish [<path>]     Move tag-named folders into the",
+        "                                 configured library (setup 12/13).",
         "  medianame setup                (Re)configure API keys, paths, preset",
         "  medianame help                 Show this help",
         "",
@@ -1352,6 +2264,7 @@ def _load_config():
     global API_KEY, TMDB_TOKEN, MOVIE_PATH, SERIES_PATH
     global NAMING_PRESET, MOVIE_ID_SOURCE, SERIES_ID_SOURCE, DEFAULT_OPERATION
     global MIN_VIDEO_SIZE_MB, MIN_VIDEO_BYTES, SCAN_IGNORE
+    global MOVIE_LIBRARY_PATH, SERIES_LIBRARY_PATH
     import config
     cfg = config.get_config()
     API_KEY = cfg["omdb_api_key"]
@@ -1371,6 +2284,9 @@ def _load_config():
                                                for e in extras if str(e).strip()}
     global SCAN_MAX_AGE_DAYS
     SCAN_MAX_AGE_DAYS = int(cfg.get("scan_max_age_days", 0) or 0)
+    # Optional library paths (empty string = disabled)
+    MOVIE_LIBRARY_PATH = cfg.get("movie_library_path") or None
+    SERIES_LIBRARY_PATH = cfg.get("series_library_path") or None
 
 
 def main():
@@ -1390,6 +2306,12 @@ def main():
     parser.add_argument("--max-age-days", type=int, default=None, metavar="N",
                         help="Scan only: skip entries older than N days "
                              "(default: value from config, 0 = no limit)")
+    parser.add_argument("--publish", action="store_true",
+                        help="Scan: force the publish step (error out if no "
+                             "library paths are configured)")
+    parser.add_argument("--no-publish", action="store_true",
+                        help="Scan: skip the publish step even if library "
+                             "paths are configured")
     args = parser.parse_args()
 
     # Handle setup and help before loading config
@@ -1405,13 +2327,26 @@ def main():
         if args.copy and args.move:
             print("❌ --copy and --move are mutually exclusive.")
             return
+        if args.publish and args.no_publish:
+            print("❌ --publish and --no-publish are mutually exclusive.")
+            return
         operation = "copy" if args.copy else ("move" if args.move else None)
         # CLI flag overrides config; if absent, fall back to configured default.
         max_age = args.max_age_days if args.max_age_days is not None \
             else SCAN_MAX_AGE_DAYS
+        publish_mode = "force" if args.publish else (
+            "off" if args.no_publish else "auto")
         process_scan(source_path=scan_path, operation=operation,
                      preset_override=args.preset,
-                     max_age_days=max_age)
+                     max_age_days=max_age,
+                     publish_mode=publish_mode)
+        return
+
+    # `medianame publish [<path>]`
+    if args.title and args.title[0].lower() == "publish":
+        _load_config()
+        publish_path = " ".join(args.title[1:]) if len(args.title) > 1 else None
+        process_publish(source_path=publish_path, operation="move")
         return
 
     if args.title and args.title[0].lower() == "help":

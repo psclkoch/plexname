@@ -198,6 +198,22 @@ def run_setup():
     scan_max_age_days = _prompt_int("    Max age (days, 0 = disabled)",
                                      default_max_age, minimum=0)
 
+    # 12. + 13. Optional library paths — enables the `publish` step.
+    print()
+    print("12) Movie library folder (OPTIONAL — leave empty to disable publish)")
+    print("    If set, newly created movie folders (and existing ones via")
+    print("    `medianame publish`) are moved from the movie folder above into")
+    print("    this library — typically your Plex/Jellyfin root.")
+    print("    Leave empty to skip this feature entirely.")
+    default = existing.get("movie_library_path", "") or ""
+    movie_library_path = _prompt_optional("    Path", default)
+
+    print()
+    print("13) TV show library folder (OPTIONAL — leave empty to disable publish)")
+    print("    Same as above, but for series.")
+    default = existing.get("series_library_path", "") or ""
+    series_library_path = _prompt_optional("    Path", default)
+
     cfg = {
         "omdb_api_key": omdb_key,
         "tmdb_token": tmdb_token,
@@ -210,6 +226,8 @@ def run_setup():
         "min_video_size_mb": min_video_size_mb,
         "scan_ignore": scan_ignore,
         "scan_max_age_days": scan_max_age_days,
+        "movie_library_path": movie_library_path,
+        "series_library_path": series_library_path,
     }
 
     save_config(cfg)
@@ -263,6 +281,18 @@ def _prompt_int(label, default, minimum=0):
             print(f"   Value must be >= {minimum}.")
             continue
         return value
+
+
+def _prompt_optional(label, default=""):
+    """Prompt for an optional value — empty input is accepted (and kept)."""
+    if default:
+        preview = default if len(default) <= 50 else default[:30] + "..." + default[-15:]
+        entry = input(f"{label} [{preview}]: ").strip()
+        if entry.lower() in ("-", "none", "off"):
+            return ""
+        return entry if entry else default
+    entry = input(f"{label} [empty = disabled]: ").strip()
+    return entry
 
 
 def _prompt_choice(label, choices, default):

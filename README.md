@@ -83,6 +83,8 @@ Not configured yet. Starting setup...
 9) Minimum video size for `scan` (in MB, default 500)
 10) Extra scan ignores (comma-separated; defaults cover #recycle, @eaDir, …)
 11) Default max age (days) for `scan` (0 = no limit)
+12) Movie library folder — optional Plex/Jellyfin target for `publish`
+13) TV show library folder — optional Plex/Jellyfin target for `publish`
 
 ✅ Configuration saved: ~/.config/medianame/config.json
 ```
@@ -101,6 +103,8 @@ medianame --preset jellyfin ...  # Override naming preset for this run
 medianame scan [<path>]          # Scan a folder and move raw media into named folders
 medianame scan --copy <path>     # Same, but copy instead of move
 medianame scan --max-age-days 7  # Only scan entries modified in the last 7 days
+medianame scan --no-publish      # Scan without the auto-publish step this run
+medianame publish [<path>]       # Move finished folders into your Plex/Jellyfin library
 medianame setup                  # (Re)configure API keys, paths, preset
 medianame help                   # Show detailed help
 ```
@@ -137,6 +141,43 @@ What is **automatically skipped** so scans on large library volumes stay fast:
 The default operation (`move` or `copy`) is set during `medianame setup` (step 8) and can be overridden per run with `--copy` / `--move`. The default max-age is step 11 and can be overridden with `--max-age-days`.
 
 > **Note on title matching.** TMDB search is driven only by the parsed title; the parsed year is used to re-rank results (preferring the matching year, then ±1). Appending the year to the query string would confuse TMDB's multi-search and return zero hits for otherwise obvious titles.
+
+### Publish to library (v1.3.0+)
+
+If you keep a **separate working area** (where medianame creates folders) from your **Plex/Jellyfin library root** (what Plex actually indexes), `publish` automates the last step: moving the finished, tag-named folders into the library.
+
+Configure it during `medianame setup`:
+
+- **Step 12** — Movie library folder (e.g. `/Volumes/Plex/Movies`)
+- **Step 13** — TV show library folder (e.g. `/Volumes/Plex/TV`)
+
+Leave empty to disable. When at least one of them is set, every successful `medianame scan` runs an interactive publish step at the end (suppress with `--no-publish`, force with `--publish`). Or run it manually:
+
+```bash
+medianame publish               # Publish everything from both staging folders
+medianame publish ~/Downloads   # Publish tag-named folders from a specific path
+```
+
+Only folders carrying a medianame ID tag (`{imdb-…}`, `{tmdb-…}`, `[imdbid-…]`, `[tmdbid-…]`) are considered — untagged content in the staging area is left alone.
+
+**Conflict handling.** Three cases trigger a prompt during publish:
+
+- **Same-name file in target folder.** Shown side-by-side with filename, size, and modified date. Options: `[r]` replace, `[s]` skip, `[b]` keep both (new file gets ` (1)` suffix), `[a]` abort.
+- **Different filename, but target already has a video.** Same comparison display. `[r]` replace all existing videos with the new one, `[s]` skip the new file, `[b]` keep both, `[a]` abort.
+- **Similar library folder with a different ID tag** (or no tag). Four explicit options:
+  - `[1]` Rename library folder to new, **keep old files** (discard new)
+  - `[2]` Rename library folder to new, **replace with new files** (discard old)
+  - `[3]` Rename library folder to new, **keep all files**
+  - `[4]` Skip (leave both as-is)
+
+**TV series specifics.** When a show already exists in the library:
+- New seasons are added without asking.
+- Existing seasons are merged episode-by-episode with the same same-name conflict prompt.
+- If the new episode uses a different naming scheme than existing episodes in the season (e.g. `Show - S04E05.mkv` vs. `Show.S04E05.mkv`), you're warned and can keep the new name, skip, or abort.
+
+**Progress indicator.** Cross-filesystem copies of files ≥ 100 MB show a per-file progress line (`Copying foo.mkv … 4.2 / 45.1 GB (9%)`). Same-filesystem moves are instant renames and skip the indicator.
+
+**Staging cleanup.** After a successful publish, the staging folder is removed if empty. If some files stayed behind (skipped conflicts, leftover `.nfo` files, samples) you get a summary listing and a prompt whether to delete anyway.
 
 ### Input formats
 
@@ -186,7 +227,12 @@ git pull
 pipx install -e . --force     # --force picks up new dependencies
 ```
 
-New config fields introduced in later versions (e.g. `default_operation` and `min_video_size_mb` in v1.2.0) fall back to sensible defaults — your existing config continues to work. Run `medianame setup` to adjust them interactively.
+New config fields introduced in later versions fall back to sensible defaults — your existing config continues to work. Run `medianame setup` to adjust them interactively. Recent additions:
+
+- v1.2.0 — `default_operation`, `min_video_size_mb`
+- v1.2.1 — `scan_ignore` (extra ignores on top of built-in defaults)
+- v1.2.2 — `scan_max_age_days`
+- v1.3.0 — `movie_library_path`, `series_library_path` (optional publish targets)
 
 ### From plexname (v1.0)
 

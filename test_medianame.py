@@ -1576,5 +1576,340 @@ class TestScanFeature(unittest.TestCase):
             self.assertEqual(f.read(), b"new-content")
 
 
+class TestPublishFeature(unittest.TestCase):
+    """Tests for the publish-to-library feature (v1.3.0)."""
+
+    def setUp(self):
+        self.staging = tempfile.mkdtemp()
+        self.library = tempfile.mkdtemp()
+        # Snapshot and clear module globals
+        self._orig = {
+            "MOVIE_PATH": medianame.MOVIE_PATH,
+            "SERIES_PATH": medianame.SERIES_PATH,
+            "MOVIE_LIBRARY_PATH": medianame.MOVIE_LIBRARY_PATH,
+            "SERIES_LIBRARY_PATH": medianame.SERIES_LIBRARY_PATH,
+        }
+        medianame.MOVIE_PATH = self.staging
+        medianame.MOVIE_LIBRARY_PATH = self.library
+
+    def tearDown(self):
+        for k, v in self._orig.items():
+            setattr(medianame, k, v)
+        shutil.rmtree(self.staging, ignore_errors=True)
+        shutil.rmtree(self.library, ignore_errors=True)
+
+    def _write(self, path, content=b"x"):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as f:
+            f.write(content)
+
+    # --- library match -----------------------------------------------------
+
+    def test_find_library_match_exact(self):
+        os.makedirs(os.path.join(self.library, "Inception (2010) {imdb-tt1375666}"))
+        kind, existing = medianame._find_library_match(
+            self.library, "Inception (2010) {imdb-tt1375666}")
+        self.assertEqual(kind, "exact")
+        self.assertEqual(existing, "Inception (2010) {imdb-tt1375666}")
+
+    def test_find_library_match_rename_candidate(self):
+        os.makedirs(os.path.join(self.library, "Inception (2010)"))
+        kind, existing = medianame._find_library_match(
+            self.library, "Inception (2010) {imdb-tt1375666}")
+        self.assertEqual(kind, "rename")
+        self.assertEqual(existing, "Inception (2010)")
+
+    def test_find_library_match_none(self):
+        os.makedirs(os.path.join(self.library, "Other Film (2020)"))
+        kind, existing = medianame._find_library_match(
+            self.library, "Inception (2010) {imdb-tt1375666}")
+        self.assertIsNone(kind)
+        self.assertIsNone(existing)
+
+    # --- plan generation ---------------------------------------------------
+
+    def test_build_publish_plan_detects_movie(self):
+        name = "Movie (2020) {imdb-tt1}"
+        src = os.path.join(self.staging, name)
+        self._write(os.path.join(src, "Movie.mkv"))
+        plan = medianame.build_publish_plan(
+            [(self.staging, self.library, "movie")])
+        self.assertEqual(len(plan), 1)
+        self.assertEqual(plan[0]["folder_name"], name)
+        self.assertEqual(plan[0]["media_type"], "movie")
+        self.assertEqual(plan[0]["match"], "new")
+
+    def test_build_publish_plan_detects_show(self):
+        name = "Show (2020) {tmdb-1}"
+        src = os.path.join(self.staging, name)
+        self._write(os.path.join(src, "Season 01", "Show.S01E01.mkv"))
+        plan = medianame.build_publish_plan(
+            [(self.staging, self.library, "movie")])
+        self.assertEqual(plan[0]["media_type"], "tv")
+
+    def test_build_publish_plan_skips_untagged(self):
+        self._write(os.path.join(self.staging, "RawFolder",
+                                  "Movie.mkv"))
+        plan = medianame.build_publish_plan(
+            [(self.staging, self.library, "movie")])
+        self.assertEqual(plan, [])
+
+    # --- execute: new folder -----------------------------------------------
+
+    def test_execute_new_folder_moves_as_is(self):
+        name = "Movie (2020) {imdb-tt1}"
+        src = os.path.join(self.staging, name)
+        self._write(os.path.join(src, "Movie.mkv"), b"data")
+        plan = [{
+            "source": src,
+            "folder_name": name,
+            "media_type": "movie",
+            "library_root": self.library,
+            "match": "new",
+            "existing_name": None,
+        }]
+        counts = medianame.execute_publish_plan(plan)
+        self.assertEqual(counts["moved"], 1)
+        self.assertFalse(os.path.exists(src))
+        self.assertTrue(os.path.isfile(
+            os.path.join(self.library, name, "Movie.mkv")))
+
+    # --- execute: exact merge (season fills in) ----------------------------
+
+    def test_merge_adds_missing_season_without_prompt(self):
+        name = "Show (2020) {tmdb-1}"
+        src = os.path.join(self.staging, name)
+        self._write(os.path.join(src, "Season 04", "Show.S04E01.mkv"), b"new")
+        self._write(os.path.join(src, "Season 04", "Show.S04E02.mkv"), b"new")
+        # Library already has seasons 1-3 but not 4
+        for s in (1, 2, 3):
+            self._write(os.path.join(self.library, name,
+                                      f"Season {s:02d}",
+                                      f"Show.S{s:02d}E01.mkv"), b"old")
+        plan = [{
+            "source": src,
+            "folder_name": name,
+            "media_type": "tv",
+            "library_root": self.library,
+            "match": "exact",
+            "existing_name": name,
+        }]
+        # No prompt expected — this should run without any input() calls
+        with patch("builtins.input",
+                   side_effect=AssertionError("should not prompt")):
+            counts = medianame.execute_publish_plan(plan)
+        self.assertEqual(counts["merged"], 1)
+        self.assertTrue(os.path.isfile(
+            os.path.join(self.library, name, "Season 04", "Show.S04E01.mkv")))
+        self.assertTrue(os.path.isfile(
+            os.path.join(self.library, name, "Season 04", "Show.S04E02.mkv")))
+
+    # --- execute: file-level conflict --------------------------------------
+
+    def test_merge_same_name_different_size_prompts_replace(self):
+        name = "Movie (2020) {imdb-tt1}"
+        src = os.path.join(self.staging, name)
+        self._write(os.path.join(src, "Movie.mkv"), b"remux-much-bigger")
+        self._write(os.path.join(self.library, name, "Movie.mkv"), b"old")
+        plan = [{
+            "source": src,
+            "folder_name": name,
+            "media_type": "movie",
+            "library_root": self.library,
+            "match": "exact",
+            "existing_name": name,
+        }]
+        # Existing has foreign-file prompt? No — same name; conflict prompt fires.
+        with patch("builtins.input", return_value="r"):
+            counts = medianame.execute_publish_plan(plan)
+        self.assertEqual(counts["merged"], 1)
+        with open(os.path.join(self.library, name, "Movie.mkv"), "rb") as f:
+            self.assertEqual(f.read(), b"remux-much-bigger")
+
+    def test_merge_identical_file_skips_silently(self):
+        name = "Movie (2020) {imdb-tt1}"
+        src = os.path.join(self.staging, name)
+        content = b"identical-bytes"
+        self._write(os.path.join(src, "Movie.mkv"), content)
+        self._write(os.path.join(self.library, name, "Movie.mkv"), content)
+        plan = [{
+            "source": src,
+            "folder_name": name,
+            "media_type": "movie",
+            "library_root": self.library,
+            "match": "exact",
+            "existing_name": name,
+        }]
+        with patch("builtins.input",
+                   side_effect=AssertionError("should not prompt")):
+            medianame.execute_publish_plan(plan)
+        # File removed from source on move
+        self.assertFalse(os.path.exists(os.path.join(src, "Movie.mkv")))
+
+    def test_merge_different_name_prompts_foreign_file(self):
+        name = "Movie (2020) {imdb-tt1}"
+        src = os.path.join(self.staging, name)
+        self._write(os.path.join(src, "Movie.Remux.mkv"), b"new")
+        self._write(os.path.join(self.library, name, "Movie.BluRay.mkv"), b"old")
+        plan = [{
+            "source": src,
+            "folder_name": name,
+            "media_type": "movie",
+            "library_root": self.library,
+            "match": "exact",
+            "existing_name": name,
+        }]
+        # Answer: replace existing with the new file
+        with patch("builtins.input", return_value="r"):
+            medianame.execute_publish_plan(plan)
+        self.assertFalse(os.path.exists(
+            os.path.join(self.library, name, "Movie.BluRay.mkv")))
+        self.assertTrue(os.path.isfile(
+            os.path.join(self.library, name, "Movie.Remux.mkv")))
+
+    def test_merge_different_name_keep_both(self):
+        name = "Movie (2020) {imdb-tt1}"
+        src = os.path.join(self.staging, name)
+        self._write(os.path.join(src, "Movie.Remux.mkv"), b"new")
+        self._write(os.path.join(self.library, name, "Movie.BluRay.mkv"), b"old")
+        plan = [{
+            "source": src,
+            "folder_name": name,
+            "media_type": "movie",
+            "library_root": self.library,
+            "match": "exact",
+            "existing_name": name,
+        }]
+        with patch("builtins.input", return_value="b"):
+            medianame.execute_publish_plan(plan)
+        self.assertTrue(os.path.isfile(
+            os.path.join(self.library, name, "Movie.BluRay.mkv")))
+        self.assertTrue(os.path.isfile(
+            os.path.join(self.library, name, "Movie.Remux.mkv")))
+
+    # --- execute: rename (tag-mismatch) ------------------------------------
+
+    def test_rename_keep_new_replaces_old(self):
+        old_name = "Movie (2020)"
+        new_name = "Movie (2020) {imdb-tt1}"
+        src = os.path.join(self.staging, new_name)
+        self._write(os.path.join(src, "Movie.Remux.mkv"), b"new")
+        self._write(os.path.join(self.library, old_name, "Movie.old.mkv"), b"old")
+        plan = [{
+            "source": src,
+            "folder_name": new_name,
+            "media_type": "movie",
+            "library_root": self.library,
+            "match": "rename",
+            "existing_name": old_name,
+        }]
+        # Choice: [2] keep new, rename to new
+        with patch("builtins.input", return_value="2"):
+            medianame.execute_publish_plan(plan)
+        self.assertFalse(os.path.exists(os.path.join(self.library, old_name)))
+        self.assertTrue(os.path.isfile(
+            os.path.join(self.library, new_name, "Movie.Remux.mkv")))
+        self.assertFalse(os.path.isfile(
+            os.path.join(self.library, new_name, "Movie.old.mkv")))
+
+    def test_rename_keep_old_discards_new(self):
+        old_name = "Movie (2020)"
+        new_name = "Movie (2020) {imdb-tt1}"
+        src = os.path.join(self.staging, new_name)
+        self._write(os.path.join(src, "Movie.Remux.mkv"), b"new")
+        self._write(os.path.join(self.library, old_name, "Movie.old.mkv"), b"old")
+        plan = [{
+            "source": src,
+            "folder_name": new_name,
+            "media_type": "movie",
+            "library_root": self.library,
+            "match": "rename",
+            "existing_name": old_name,
+        }]
+        with patch("builtins.input", return_value="1"):
+            medianame.execute_publish_plan(plan)
+        # Library now uses new name, keeps old file
+        self.assertTrue(os.path.isfile(
+            os.path.join(self.library, new_name, "Movie.old.mkv")))
+        self.assertFalse(os.path.exists(src))
+
+    def test_rename_skip_leaves_both(self):
+        old_name = "Movie (2020)"
+        new_name = "Movie (2020) {imdb-tt1}"
+        src = os.path.join(self.staging, new_name)
+        self._write(os.path.join(src, "Movie.mkv"), b"new")
+        self._write(os.path.join(self.library, old_name, "Movie.mkv"), b"old")
+        plan = [{
+            "source": src,
+            "folder_name": new_name,
+            "media_type": "movie",
+            "library_root": self.library,
+            "match": "rename",
+            "existing_name": old_name,
+        }]
+        with patch("builtins.input", return_value="4"):
+            counts = medianame.execute_publish_plan(plan)
+        self.assertTrue(os.path.isdir(os.path.join(self.library, old_name)))
+        self.assertTrue(os.path.isdir(src))
+        self.assertEqual(counts["skipped"], 1)
+
+    # --- staging cleanup ---------------------------------------------------
+
+    def test_cleanup_removes_empty_staging(self):
+        folder = os.path.join(self.staging, "empty")
+        os.makedirs(folder)
+        medianame._cleanup_staging(folder)
+        self.assertFalse(os.path.exists(folder))
+
+    def test_cleanup_prompts_when_residual(self):
+        folder = os.path.join(self.staging, "residual")
+        self._write(os.path.join(folder, "leftover.nfo"), b"meta")
+        # Answer "n" → keep folder
+        with patch("builtins.input", return_value="n"):
+            medianame._cleanup_staging(folder)
+        self.assertTrue(os.path.exists(folder))
+
+    def test_cleanup_deletes_when_confirmed(self):
+        folder = os.path.join(self.staging, "residual")
+        self._write(os.path.join(folder, "leftover.nfo"), b"meta")
+        with patch("builtins.input", return_value=""):
+            medianame._cleanup_staging(folder)
+        self.assertFalse(os.path.exists(folder))
+
+    # --- schema detection --------------------------------------------------
+
+    def test_episode_schema_signature(self):
+        self.assertEqual(
+            medianame._episode_schema_signature("Show - S01E02 - Title.mkv"),
+            "Show - S##E## - Title")
+        # Same show, same scheme → same signature
+        a = medianame._episode_schema_signature("Show.S04E05.mkv")
+        b = medianame._episode_schema_signature("Show.S04E06.mkv")
+        self.assertEqual(a, b)
+        # Different scheme → different
+        c = medianame._episode_schema_signature("Show - S04E05 - Foo.mkv")
+        self.assertNotEqual(a, c)
+
+    # --- progress copy -----------------------------------------------------
+
+    def test_copy_with_progress_small_uses_copy2(self):
+        src = os.path.join(self.staging, "small.mkv")
+        dst = os.path.join(self.staging, "small_dst.mkv")
+        with open(src, "wb") as f:
+            f.write(b"x" * 1024)
+        medianame._copy_with_progress(src, dst)
+        self.assertTrue(os.path.isfile(dst))
+        with open(dst, "rb") as f:
+            self.assertEqual(len(f.read()), 1024)
+
+    # --- process_publish configuration check -------------------------------
+
+    def test_process_publish_without_config_errors(self):
+        medianame.MOVIE_LIBRARY_PATH = None
+        medianame.SERIES_LIBRARY_PATH = None
+        # Should print an error and return without raising
+        medianame.process_publish()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
